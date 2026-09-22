@@ -1,0 +1,8 @@
+snap.png
+node_modules/
+.DS_Store
+# private keys never belong in the repo (the private CA lives in ~/.plane-transit-ca)
+*.key
+.plane-transit-ca/
+# personal notes about your own box (see DEPLOY.md)
+*.local.md

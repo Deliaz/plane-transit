@@ -1,0 +1,33 @@
+[Unit]
+Description=Plane Transit: predicts planes crossing the moon and the sun
+Documentation=https://github.com/Deliaz/plane-transit
+# The local receiver is a bonus, not a requirement: start either way.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# deploy.sh substitutes the __PLACEHOLDERS__ before installing
+User=__USER__
+WorkingDirectory=__DIR__
+Environment=PLANE_TRANSIT_PORT=__PORT__
+Environment=PLANE_TRANSIT_LOCAL_URL=__LOCAL_URL__
+# HTTPS turns itself on once deploy/make-cert.sh has put a certificate here
+Environment=PLANE_TRANSIT_TLS_DIR=__TLS_DIR__
+Environment=PLANE_TRANSIT_TLS_PORT=__TLS_PORT__
+ExecStart=/usr/bin/node __DIR__/serve.js
+Restart=on-failure
+RestartSec=5
+# The feeder containers are the important thing on this box; stay out of their way.
+Nice=5
+# It serves files out of its own directory and talks HTTP. Nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryMax=250M
+
+[Install]
+WantedBy=multi-user.target

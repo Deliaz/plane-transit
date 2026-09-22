@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test test/*.test.js
+      - name: Shell scripts parse
+        run: for f in deploy/*.sh; do bash -n "$f"; done
+
+  # The README promises Node 14 for the server: start it there and ask it a few things.
+  node14:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 14
+      - name: serve.js starts and answers on Node 14
+        run: |
+          PLANE_TRANSIT_BIND=127.0.0.1 node serve.js &
+          for i in $(seq 20); do curl -fsS http://127.0.0.1:8321/api/status >/dev/null && break; sleep 0.5; done
+          curl -fsS http://127.0.0.1:8321/ | grep -q '<title>'
+          curl -fsS http://127.0.0.1:8321/api/status | grep -q '"ok": true'
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8321/.git/config)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8321/%')" = 404
