@@ -125,7 +125,10 @@ Three things worth knowing up front:
   next 5 min, tinted band at the bottom = below the horizon.
 - Planes: dot = where the plane is *now* (extrapolated from its last fix, so it is
   always the first point of its own line), solid line = predicted track with
-  `+30s` / `+60s` ticks, faint line = recent trail, dashed circle + `0.4R @+37s`
+  `+30s` / `+60s` ticks and arrowheads the way the plane flies (so a line crossing
+  the view says where it comes from even while the dot is off screen; the heads are
+  drawn in perspective, growing along the line of a plane coming towards you),
+  faint line = recent trail, dashed circle + `0.4R @+37s`
   label = closest approach with position uncertainty. Red = nominal path crosses the
   disc, orange = near miss (within 3 radii, or a possible transit within the
   uncertainty), grey = far.
@@ -181,14 +184,20 @@ Three things worth knowing up front:
   predictions against what you actually see; off keeps only true transits), **map**
   shows or hides the inset, **?** explains every mark.
 - **Next-pass card** (top of the sky view): the plane the countdown follows, or the
-  next transit — flight, a large "in 36 s" / "NOW", miss distance, uncertainty and
-  trust. Readable from a metre away with your eye near the camera.
+  next transit — flight, an arrow for the way it crosses the sky, a large "in 36 s" /
+  "NOW", miss distance, uncertainty and trust. Readable from a metre away with your
+  eye near the camera.
 - **Target below the horizon**: instead of an empty view, the app says when it rises,
   in which direction, and when it is 10° up — and offers the other body if that one
   is up. No planes are fetched meanwhile.
-- **Predicted passes** table: ETA of closest approach, minimum separation in target
-  radii (R), ± uncertainty, and trust (drops with data age; ⚠ = plane is maneuvering,
-  linear prediction unreliable).
+- **Predicted passes** table: direction (an arrow the way the plane crosses the sky at
+  closest approach, as in the sky view — it comes into view from the opposite side,
+  so you know which edge of the frame to watch while it is still off screen), ETA of
+  closest approach, minimum separation in target radii (R), ± uncertainty, and trust
+  (drops with data age; ⚠ = plane is maneuvering, linear prediction unreliable).
+  `1.4→0.6 R` means the last few reports keep moving the miss: the plane is turning
+  (or climbing) towards the disc or away from it, and the truth is probably further
+  along in the same direction.
 
 ## How it works / accuracy notes
 

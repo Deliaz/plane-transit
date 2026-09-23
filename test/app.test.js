@@ -94,6 +94,35 @@ test('predict does not call a clear miss a transit', () => {
   assert.notStrictEqual(planeThrough(2.5 * 0.26, 30).klass, 'transit');
 });
 
+test('the direction arrow is in the sky view frame: 0 up, 90 right', () => {
+  placeObserver(run, 51.4778, -0.0014, 45);
+  run('target = { az: 180, el: 20, angR: 0.26, azRate: 0, elRate: 0, illum: null, limb: null }');
+  // facing south, east is to the left and west to the right; flying away sinks
+  const dir = track => planeThrough(0, 30, { track }).pred.dir;
+  assert.ok(Math.abs(dir(90) + 90) < 2, `eastbound ${dir(90)}`);
+  assert.ok(Math.abs(dir(270) - 90) < 2, `westbound ${dir(270)}`);
+  assert.ok(Math.abs(Math.abs(dir(180)) - 180) < 2, `southbound ${dir(180)}`);
+  // the camera follows the target, so its drift counts against the plane's motion
+  run('target.azRate = 0.01');
+  const slow = planeThrough(0, 30, { track: 180, gs: 20, rangeM: 30000 }).pred.dir;
+  assert.ok(slow < -120 && slow > -178, `slow plane, drifting target ${slow}`);
+});
+
+test('the miss trend shows only real movement between fixes', () => {
+  placeObserver(run, 51.4778, -0.0014, 45);
+  run('target = { az: 135, el: 20, angR: 0.26, azRate: 0, elRate: 0, illum: null, limb: null }');
+  const from = (ghostMissR, tHit = 30) => run(`(() => {
+    const p = ${JSON.stringify(planeThrough(0.1 * 0.26, tHit))};
+    p.ghosts = [{ seen: Date.now() - 6000, miss: null, pts: [] },
+                { seen: Date.now() - 3000, miss: ${ghostMissR} * target.angR, pts: [] }];
+    const f = missFrom(p);
+    return f == null ? null : f / target.angR;
+  })()`);
+  assert.ok(Math.abs(from(1.5) - 1.5) < 1e-9, 'turning in: 1.5 -> 0.1 R');
+  assert.strictEqual(from(0.25), null, 'jitter below TREND_R');
+  assert.strictEqual(from(1.5, 0.2), null, 'closest approach already here: no trend');
+});
+
 test('countdown blips tighten towards the tone and the tone stays centred', () => {
   assert.deepStrictEqual([25, 10, 5, 0.5].map(s => run(`beepGap(${s})`)), [2, 1, 0.5, 0.15]);
   const win = pr => [...run(`toneWindow(${JSON.stringify(pr)})`)];

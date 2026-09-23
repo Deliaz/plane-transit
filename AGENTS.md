@@ -262,6 +262,26 @@ model says how wrong a track *could* be; the fan shows how much it is actually m
 A straight mock plane's ghosts agree to ~0.03 deg at +30 s; mock planes turning at
 0.2-0.6 deg/s fan out 0.25-2.6 deg, growing as range shrinks.
 
+The fan's numeric side is the **miss trend**: each curve also keeps `miss` (its
+`sepMin`, or null when the minimum sat at either end of the window — passed, or still
+coming — see `realMin()`), and `missFrom()` returns the oldest ghost's miss when the
+current one differs by at least `TREND_R` (0.5 R). The passes table and the card then
+show `1.4→0.6 R`. Measured on live adsb.fi traffic (Sept 2026, moon at 20 deg): a
+steady plane moves it 0.02-0.3 R between fixes; a departure turning 35 deg moved it by
+tens of R. A turn shows up here even when it is too gentle for `maneuvering`.
+It is shown instead of "turning towards / away from you": which way the plane turns
+on the ground does not say whether it turns onto the disc; this does.
+
+`pred.dir` is the way the plane crosses the sky at closest approach, relative to the
+target (the camera follows it), in the sky view's frame: degrees from up towards
+screen right, like `target.limb`. The table and card draw it as a rotated SVG arrow
+(`dirArrow()`, `#ncDir`); with the plane off screen it is what says which edge of the
+frame it will enter from. In the sky view, `drawHeads()` puts arrowheads along each
+predicted line every `HEAD_GAP` px of screen, sized `120000 / range` (3.5-8 px): the
+one depth cue the flat sky view has. A sideways crosser keeps them even; a plane
+closing from 28 to 19 km grows them ~45% along its line. Deliberately not a drawn 3D
+arrow: a foreshortened arrow reads the same pointing in or out.
+
 ## Error model
 
 `posErr = 60 + gs*0.3 + growth*(age + t)` meters, converted to an angle via the slant

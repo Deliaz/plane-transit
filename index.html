@@ -106,6 +106,9 @@
   #nextCard.near .badge, #nextCard.near .eta { color: var(--near); }
   #nextCard .eta { font-size: 40px; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }
   #nextCard .sub { font-size: 13px; color: var(--dim); }
+  #ncDir { display: inline-block; margin-right: .25em; line-height: 0; vertical-align: -0.05em; }
+  #ncDir .dir { width: .7em; height: .7em; }
+  svg.dir { width: 1em; height: 1em; vertical-align: -0.15em; display: inline-block; }
   #skyState {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
     max-width: min(420px, calc(100% - 32px)); padding: 14px 16px; text-align: center;
@@ -250,7 +253,7 @@
     <canvas id="map"></canvas>
     <div id="nextCard" class="glass" hidden>
       <div class="top"><b id="ncFlight"></b><span class="badge" id="ncBadge"></span><span id="ncArmed"></span></div>
-      <div class="eta" id="ncEta"></div>
+      <div class="eta"><span id="ncDir"><svg class="dir" viewBox="-6 -6 12 12" aria-hidden="true"><path d="M0-5.5 5 1H1.6V5.5H-1.6V1H-5Z" fill="currentColor"/></svg></span><span id="ncEta"></span></div>
       <div class="sub" id="ncSub"></div>
     </div>
     <div id="skyState" class="glass" hidden></div>
@@ -270,8 +273,11 @@
         <dt>R</dt><dd>one disc radius (~0.26°): 0.0 R = dead centre, under 1.0 R = on the disc</dd>
         <dt>dot</dt><dd>where the plane is now (extrapolated from its last report)</dd>
         <dt>line</dt><dd>predicted path, with +30 s / +60 s ticks; faint tail = recent trail</dd>
+        <dt>▸ on a line</dt><dd>the way the plane flies, even with its dot off screen. Bigger = closer to you: heads growing along a line = coming towards you</dd>
         <dt>fan</dt><dd>fading older predictions — if they spread, the plane is turning or the data is jumpy</dd>
         <dt>◌ + label</dt><dd>closest approach, uncertainty circle, e.g. <b>0.4R @+37s</b></dd>
+        <dt>arrow</dt><dd>in the passes list and the card: the same direction at closest approach — it comes into view from the opposite side</dd>
+        <dt>1.4→0.6 R</dt><dd>the miss keeps moving with each report: the plane is turning towards the disc (or away)</dd>
         <dt class="c-transit">red</dt><dd>predicted to cross the disc</dd>
         <dt class="c-near">orange</dt><dd>near miss, or a possible transit within the uncertainty</dd>
         <dt>grey</dt><dd>everything else</dd>
@@ -284,8 +290,9 @@
       <h2>Predicted passes <span class="sub">· next 90 s</span></h2>
       <table id="passTable">
         <thead><tr><th>Flight</th>
+          <th title="Which way the plane crosses the sky at closest approach, as drawn in the sky view (↑ up, → right). It comes into view from the opposite side.">dir</th>
           <th title="Seconds until closest approach">ETA</th>
-          <th title="Closest distance from the disc centre, in disc radii (R). Under 1.0 R = crosses the disc">miss</th>
+          <th title="Closest distance from the disc centre, in disc radii (R). Under 1.0 R = crosses the disc. 1.4→0.6 R = the last few reports keep moving it: the plane is turning or climbing towards the disc (or away), and the truth is likely further along">miss</th>
           <th title="Uncertainty of that miss distance, in disc radii">±</th>
           <th title="How fresh and steady the data is. ⚠ = the plane is turning or climbing, the straight-line prediction is unreliable">trust</th></tr></thead>
         <tbody></tbody>

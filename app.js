@@ -272,7 +272,7 @@ function predict(p, nowMs) {
   let best = null;
   for (let t = 0; t <= PREDICT_S; t += 1) {
     const s = sepAt(p, age, t);
-    if (t % 2 === 0) samples.push({ t, az: s.az, el: s.el, delta: errAt(t, s.range) });
+    if (t % 2 === 0) samples.push({ t, az: s.az, el: s.el, range: s.range, delta: errAt(t, s.range) });
     if (!best || s.sep < best.sep) best = { t, sep: s.sep };
   }
   // Refine to 0.05 s around the coarse minimum. At 1 s steps a close jet moves
@@ -296,10 +296,17 @@ function predict(p, nowMs) {
     while (tOut < best.t + 2.5 && sepAt(p, age, tOut + 0.02).sep <= r) tOut += 0.02;
   }
   const delta = errAt(best.t, closest.range);
+  // Which way the plane crosses the sky at closest approach, relative to the target
+  // (the camera follows it): degrees from "up" towards screen right, the sky view's
+  // own frame. With the plane off screen, this is what says which side of the frame
+  // it will come in from — the opposite one.
+  const a = sepAt(p, age, best.t - 0.5), b = sepAt(p, age, best.t + 0.5);
+  const dir = Math.atan2(wrapDeg(b.az - a.az) * Math.cos(closest.el * D2R) - target.azRate * Math.cos(target.el * D2R),
+    b.el - a.el - target.elRate) * R2D;
   p.pred = {
     at: nowMs,                     // wall-clock ms that t = 0 refers to
     samples, tBest: best.t, tMin: Math.round(best.t),
-    azMin: closest.az, elMin: closest.el, sepMin: best.sep, delta, tIn, tOut,
+    azMin: closest.az, elMin: closest.el, sepMin: best.sep, delta, tIn, tOut, dir,
   };
   p.trust = (age < 6 && !p.maneuvering) ? 'high' : (age < 15 ? 'med' : 'low');
   // transit = nominal path crosses the disc; near = close pass, or a possible
@@ -315,9 +322,26 @@ function predict(p, nowMs) {
   if (fixKey !== p.fixKey) {
     p.fixKey = fixKey;
     if (p.curve) p.ghosts.push(p.curve);
-    p.curve = { seen: nowMs, pts: samples.map(s => ({ T: nowMs + s.t * 1000, az: s.az, el: s.el })) };
+    p.curve = { seen: nowMs, miss: realMin(best.t) ? best.sep : null,
+      pts: samples.map(s => ({ T: nowMs + s.t * 1000, az: s.az, el: s.el })) };
   }
   p.ghosts = p.ghosts.filter(g => nowMs - g.seen < GHOST_S * 1000);
+}
+// A closest approach still ahead and inside the window. At either end the "minimum"
+// is only where the search stopped: a plane that has passed, or is still coming.
+const realMin = t => t > 0.5 && t < PREDICT_S - 1;
+
+// The numbers behind the fan: where the oldest fix still in it put the miss, if the
+// current fix moves that by at least TREND_R. Straight-line dead reckoning cannot
+// follow a turn, so each new fix shifts the miss the same way — 1.6 → 1.1 → 0.5 R
+// is a plane turning onto the disc, and the truth is likely further along.
+// On live traffic a steady plane moves it 0.02-0.3 R from fix to fix; a turn, by
+// whole radii (a 0.1 deg/s turn is ~1 R in 10 s at 30 km).
+const TREND_R = 0.5;
+function missFrom(p) {
+  const g = p.ghosts.find(g => g.miss != null);
+  if (!g || !realMin(p.pred.tBest)) return null;
+  return Math.abs(p.pred.sepMin - g.miss) >= TREND_R * target.angR ? g.miss : null;
 }
 
 // ---------- live data ----------
@@ -343,7 +367,8 @@ function pollPause() {
 let backoffUntil = 0;
 let fetchGen = 0;              // bumped by restartFetch(); stale responses are dropped
 async function fetchLive() {
-  if (!hasLocation() || Date.now() < backoffUntil) return;
+  // mock has no feed; the server would answer src=mock with adsb.fi's real planes
+  if (!hasLocation() || cfg.source === 'mock' || Date.now() < backoffUntil) return;
   const paused = pollPause();
   if (paused) {
     planes.clear();
@@ -573,15 +598,14 @@ function render() {
       for (let j = i; j < g.pts.length; j++) ctx.lineTo(...project(g.pts[j].az, g.pts[j].el, cx, cy, ppd));
       ctx.stroke();
     }
-    // predicted path with ETA ticks
+    // predicted path with ETA ticks and arrowheads
     ctx.strokeStyle = col; ctx.lineWidth = k === 'far' ? 1 : 1.8;
+    const path = p.pred.samples.map(s => project(s.az, s.el, cx, cy, ppd));
     ctx.beginPath();
-    p.pred.samples.forEach((s, i) => {
-      const [x, y] = project(s.az, s.el, cx, cy, ppd);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
+    path.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
     ctx.stroke();
     ctx.fillStyle = col;
+    drawHeads(path, p.pred.samples, W, H);
     for (const s of p.pred.samples) {
       if (s.t === 30 || s.t === 60) {
         const [x, y] = project(s.az, s.el, cx, cy, ppd);
@@ -625,6 +649,32 @@ function render() {
   }
 
   if (cfg.showMap) renderMap(colors, kOf);
+}
+
+// Arrowheads along a predicted path, HEAD_GAP px apart on screen whatever the zoom, so
+// any stretch of line in view says which way the plane flies — the dot is often off
+// screen. Sized in perspective (1/range, clamped): a plane crossing sideways keeps
+// even heads, one coming towards you grows them along its line. That is the depth
+// the sky view has no other way to show; where it appears is all flat.
+const HEAD_GAP = 90;
+function drawHeads(path, samples, W, H) {
+  let next = HEAD_GAP / 2;
+  for (let i = 1; i < path.length; i++) {
+    const [x0, y0] = path[i - 1], [x1, y1] = path[i];
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    for (; next <= len; next += HEAD_GAP) {
+      const f = next / len, x = x0 + (x1 - x0) * f, y = y0 + (y1 - y0) * f;
+      if (x < -10 || y < -10 || x > W + 10 || y > H + 10) continue;
+      const range = samples[i - 1].range + (samples[i].range - samples[i - 1].range) * f;
+      const s = Math.min(8, Math.max(3.5, 120000 / range));
+      ctx.save();
+      ctx.translate(x, y); ctx.rotate(Math.atan2(y1 - y0, x1 - x0));
+      ctx.beginPath(); ctx.moveTo(s, 0); ctx.lineTo(-s * 0.8, s * 0.75); ctx.lineTo(-s * 0.8, -s * 0.75);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    next -= len;
+  }
 }
 
 // The moon as it looks: a faint full disc (a plane still crosses the dark part, it
@@ -760,6 +810,15 @@ function renderMap(colors, kOf) {
 // ---------- tables & header ----------
 const $ = id => document.getElementById(id);
 function fmtSep(sep) { return (sep / target.angR).toFixed(1) + ' R'; }
+// predicted miss, with where it stood a few fixes ago when that has moved: 1.2→0.4 R
+function fmtMiss(p) {
+  const from = missFrom(p);
+  return (from == null ? '' : (from / target.angR).toFixed(1) + '→') + fmtSep(p.pred.sepMin);
+}
+// an arrow pointing the way the plane crosses the sky (pred.dir: 0 = up, 90 = right)
+const DIR_SVG = '<svg class="dir" viewBox="-6 -6 12 12" aria-hidden="true">'
+  + '<path d="M0-5.5 5 1H1.6V5.5H-1.6V1H-5Z" fill="currentColor"/></svg>';
+const dirArrow = deg => DIR_SVG.replace('<path', `<path transform="rotate(${deg.toFixed(0)})"`);
 
 function renderTables() {
   const list = [...planes.values()].filter(p => p.pred);
@@ -770,8 +829,8 @@ function renderTables() {
     .sort((a, b) => a.pred.tMin - b.pred.tMin);
   const pb = $('passTable').tBodies[0];
   pb.innerHTML = passes.map(p => `<tr class="${p.klass}">
-    <td>${p.flight}${alerted.has(p.hex) ? ' ♪' : ''}</td><td>${p.pred.tMin}s</td>
-    <td>${fmtSep(p.pred.sepMin)}</td><td>${fmtSep(p.pred.delta)}</td>
+    <td>${p.flight}${alerted.has(p.hex) ? ' ♪' : ''}</td><td>${dirArrow(p.pred.dir)}</td><td>${p.pred.tMin}s</td>
+    <td>${fmtMiss(p)}</td><td>${fmtSep(p.pred.delta)}</td>
     <td>${p.trust}${p.maneuvering ? ' ⚠' : ''}</td></tr>`).join('');
   $('passEmpty').style.display = passes.length ? 'none' : '';
 
@@ -836,7 +895,8 @@ function renderNextCard() {
   $('ncBadge').textContent = p.klass === 'transit' ? 'TRANSIT' : 'NEAR MISS';
   $('ncArmed').textContent = armed.has(p.hex) ? '♪ countdown' : '';
   $('ncEta').textContent = onDisc ? 'NOW' : s > 0 ? `in ${s < 10 ? s.toFixed(1) : Math.round(s)} s` : 'passed';
-  $('ncSub').textContent = `miss ${(pr.sepMin / target.angR).toFixed(1)} R ± `
+  $('ncDir').style.transform = `rotate(${pr.dir.toFixed(0)}deg)`;
+  $('ncSub').textContent = `miss ${fmtMiss(p)} ± `
     + `${(pr.delta / target.angR).toFixed(1)} · trust ${p.trust}${p.maneuvering ? ' ⚠ turning' : ''}`
     + ` · ${(p.range / 1000).toFixed(0)} km away, ${(p.altM / 1000).toFixed(1)} km up`;
 }
