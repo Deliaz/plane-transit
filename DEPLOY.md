@@ -89,8 +89,9 @@ by speed × cache age, ~500 m for an airliner.
 ## The local receiver (addition and backup, never a replacement)
 
 If the box also runs an ADS-B receiver, point `PLANE_TRANSIT_LOCAL_URL` at its tar1090 JSON
-— on the adsb.im image that is `http://localhost:8080/data/aircraft.json`, which is
-what `deploy.sh` sets by default. Same schema as the public APIs. The server merges it
+— on the adsb.im image that is `http://localhost:8080/data/aircraft.json`, which
+`deploy.sh` uses by itself when the box answers on it (`PLANE_TRANSIT_LOCAL_URL=` turns
+it off). Same schema as the public APIs. The server merges it
 **per aircraft**:
 
 - the public feed is the base list;

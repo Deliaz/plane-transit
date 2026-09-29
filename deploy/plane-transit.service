@@ -17,7 +17,7 @@ Environment=PLANE_TRANSIT_TLS_PORT=__TLS_PORT__
 ExecStart=/usr/bin/node __DIR__/serve.js
 Restart=on-failure
 RestartSec=5
-# The feeder containers are the important thing on this box; stay out of their way.
+# Anything else on this box (an ADS-B feeder, say) matters more; stay out of its way.
 Nice=5
 # It serves files out of its own directory and talks HTTP. Nothing else.
 NoNewPrivileges=yes

@@ -14,7 +14,8 @@ set -euo pipefail
 HOST="${PLANE_TRANSIT_HOST:-pi}"
 PORT="${PLANE_TRANSIT_PORT:-8321}"
 # The adsb.im feeder image serves its receiver's aircraft.json here (ultrafeeder/tar1090).
-LOCAL_URL="${PLANE_TRANSIT_LOCAL_URL:-http://localhost:8080/data/aircraft.json}"
+# Used only if the box answers on it; PLANE_TRANSIT_LOCAL_URL= (empty) turns it off.
+ADSBIM_URL=http://localhost:8080/data/aircraft.json
 TLS_PORT="${PLANE_TRANSIT_TLS_PORT:-8443}"
 SERVICE=plane-transit
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -42,6 +43,13 @@ TLS_DIR="${PLANE_TRANSIT_TLS_DIR:-$REMOTE_HOME/.config/plane-transit/tls}"
 
 REMOTE_NODE=$(ssh "$HOST" 'command -v node || true')
 [ -n "$REMOTE_NODE" ] || die "node is not installed on $HOST (sudo apt install -y nodejs)"
+
+if [ -n "${PLANE_TRANSIT_LOCAL_URL+set}" ]; then
+  LOCAL_URL="$PLANE_TRANSIT_LOCAL_URL"
+else
+  LOCAL_URL=$(ssh "$HOST" "curl -fsS --max-time 3 $ADSBIM_URL 2>/dev/null | grep -q '\"aircraft\"' && echo $ADSBIM_URL || true")
+fi
+say "local receiver: ${LOCAL_URL:-none}"
 
 say "shipping $REPO → $HOST:$DIR"
 git -C "$REPO" status --short | sed 's/^/    uncommitted: /' || true
