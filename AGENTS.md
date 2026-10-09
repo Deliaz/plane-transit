@@ -393,7 +393,14 @@ countdown and a tone (~4 s) and doubles as the gesture that unlocks `AudioContex
 a cue you only discover is silent during the actual transit window is worthless.
 
 Browsers block `AudioContext` until a user gesture; `ensureAudio()` returns null while
-suspended. The header shows "click to enable" until then.
+suspended. The header shows "click to enable" until then. It resumes from **any**
+state but `running`, not just `suspended`: iOS Safari parks the context in a
+non-standard `interrupted` state after the page has been in the background (camera
+app, lock screen, a call). An earlier `=== 'suspended'` check left it there, silent
+until a reload, while "tap to enable" did nothing. A context that was once started may
+resume without a gesture, so the countdown loop and a `visibilitychange` handler bring
+it back on their own. Chromium has no `interrupted`; to test, override the instance's
+`state` getter to report a real `suspend()` as `interrupted`.
 
 **Screen wake lock.** While sound is on and the page is visible, `syncWakeLock()`
 holds `navigator.wakeLock` ('screen'), re-requesting on `visibilitychange` (browsers

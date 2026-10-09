@@ -1312,6 +1312,8 @@ $('btnSoundTest').addEventListener('click', () => {
     : 'No audio: the browser is blocking it, or this device has no output.';
 });
 document.addEventListener('click', ensureAudio);   // browsers need a gesture first
+// back on screen (from the camera app, say): wake the context before the next cue
+document.addEventListener('visibilitychange', () => { if (!document.hidden && audioCtx) ensureAudio(); });
 
 // ---------- position picker map ----------
 // OSM tiles around the position with a pin; a tap moves the pin there. For the last
@@ -1396,7 +1398,10 @@ function ensureAudio() {
     audioCtx = new AC();
     audioCtx.addEventListener('statechange', renderSoundBtn);   // "tap to enable" → "on"
   }
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  // not just 'suspended' (no gesture yet): iOS reports 'interrupted' after the page
+  // was in the background — camera app, lock screen, a call — and a context left
+  // there stayed silent until a reload, taps on "tap to enable" included
+  if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
   return audioCtx.state === 'running' ? audioCtx : null;
 }
 
