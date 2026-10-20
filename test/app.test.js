@@ -124,7 +124,7 @@ test('the miss trend shows only real movement between fixes', () => {
 });
 
 test('countdown blips tighten towards the tone and the tone stays centred', () => {
-  assert.deepStrictEqual([25, 10, 5, 0.5].map(s => run(`beepGap(${s})`)), [2, 1, 0.5, 0.15]);
+  assert.deepStrictEqual([90, 25, 10, 5, 0.5].map(s => run(`beepGap(${s})`)), [5, 2.5, 1, 0.5, 0.15]);
   const win = pr => [...run(`toneWindow(${JSON.stringify(pr)})`)];
   near(win({ tBest: 30.1, tIn: 29.8, tOut: 30.4 }), [29.8, 30.4], 1e-9, 'normal crossing');
   near(win({ tBest: 30, tIn: 29.95, tOut: 30.05 }), [29.825, 30.175], 1e-9, 'brief: 0.35 s minimum');
@@ -136,16 +136,53 @@ test('arming is strict, staying armed is loose', () => {
   run(`planes.clear(); resetCountdown(); cfg.sound = true;
     target = { az: 135, el: 20, angR: 0.26, azRate: 0, elRate: 0, illum: null, limb: null };
     var P = { hex: 'a', klass: 'transit', trust: 'high',
-      pred: { at: Date.now(), tBest: 20, sepMin: 0.05, delta: 0.3, elMin: 10 } };
+      pred: { at: Date.now(), tBest: 20, sepMin: 0.05, delta: 0.3, delta0: 0.3, elMin: 10 } };
     planes.set('a', P);`);
   const armedNow = setup => run(`${setup}; checkAlerts(); armed.has('a')`);
   assert.ok(armedNow(''), 'a confident transit arms');
   assert.ok(armedNow(`P.klass = 'near'; P.trust = 'low'; P.pred.sepMin = 1.2 * 0.26`), '1.2 R keeps it');
   assert.ok(!armedNow('P.pred.sepMin = 2.0 * 0.26'), '2 R disarms');
   assert.ok(!armedNow(`P.klass = 'near'; P.trust = 'high'; P.pred.sepMin = 1.4 * 0.26`), '1.4 R never arms');
-  assert.ok(!armedNow(`P.klass = 'transit'; P.pred.sepMin = 0.05; P.pred.tBest = 45`), 'too far ahead');
-  assert.ok(armedNow('P.pred.tBest = 20'), 're-arms');
+  assert.ok(!armedNow(`P.klass = 'transit'; P.pred.sepMin = 0.05; P.pred.tBest = 95`), 'beyond 90 s');
+  // 85 s of dead reckoning widens delta; only the fix's own uncertainty counts
+  assert.ok(armedNow('P.pred.tBest = 85; P.pred.delta = 1.5'), '85 s out arms');
+  assert.ok(!armedNow('P.pred.sepMin = 2.0 * 0.26'), 'drifts off');
+  assert.ok(!armedNow('P.pred.sepMin = 0.05; P.pred.delta0 = 1.0'), 'a mushy fix never arms');
+  assert.ok(armedNow('P.pred.tBest = 20; P.pred.delta = P.pred.delta0 = 0.3'), 're-arms');
   assert.ok(!armedNow('P.pred.tBest = 0'), 'passed: disarms');
   assert.ok(!armedNow('P.pred.tBest = 20; cfg.sound = false'), 'sound off: disarms');
   run('planes.clear(); resetCountdown()');
+});
+
+test('every heads-up ends in a tone or a call-off, a turn included', () => {
+  // an AudioContext that only records the pitch of each note it is asked to play
+  run(`planes.clear(); resetCountdown(); alerted.clear(); cfg.sound = true; audioCtx = null;
+    var played = [];
+    window.AudioContext = function () {
+      const param = { setValueAtTime() {}, exponentialRampToValueAtTime() {} };
+      Object.assign(this, { state: 'running', currentTime: 0, destination: {},
+        addEventListener() {}, resume: () => Promise.resolve(),
+        createGain: () => ({ gain: param, connect: d => d }),
+        createOscillator: () => {
+          const o = { frequency: {}, connect: g => g, stop() {}, start() { played.push(o.frequency.value); } };
+          return o;
+        } });
+    };
+    target = { az: 135, el: 20, angR: 0.26, azRate: 0, elRate: 0, illum: null, limb: null };
+    var P = { hex: 'b', klass: 'transit', trust: 'high',
+      pred: { at: Date.now(), tBest: 80, sepMin: 0.05, delta: 1.2, delta0: 0.3, elMin: 10 } };
+    planes.set('b', P);`);
+  const heard = setup => run(`played.length = 0; ${setup}; checkAlerts(); played.join(' ')`);
+  const UP = '784 1046.5', OFF = '1046.5 784';
+  assert.strictEqual(heard(''), UP, '80 s out: heads-up');
+  assert.strictEqual(heard('P.pred.tBest = 60'), '', 'still on track: nothing new');
+  // turned back: its closest approach is now, far from the disc — not a pass
+  assert.strictEqual(heard('P.pred.tBest = 0; P.pred.sepMin = 40 * 0.26'), OFF, 'turned away');
+  assert.strictEqual(heard('P.pred.tBest = 50; P.pred.sepMin = 0.05'), UP, 'back on track: heads-up again');
+  assert.strictEqual(heard('P.pred.sepMin = 2 * 0.26'), OFF, 'drifted to a clear miss');
+  assert.strictEqual(heard('P.pred.sepMin = 0.05'), UP, 'and back');
+  assert.strictEqual(heard(`planes.delete('b')`), OFF, 'lost from the feed');
+  assert.strictEqual(heard(`planes.set('b', P)`), UP, 'found again');
+  assert.strictEqual(heard('P.pred.tBest = 0'), '', 'passed on the disc: no call-off');
+  run('planes.clear(); resetCountdown(); alerted.clear(); delete window.AudioContext; audioCtx = null');
 });

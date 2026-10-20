@@ -356,26 +356,36 @@ and the rings will be wrong by ~60% at this latitude. Keep the OSM attribution.
 
 ## Audio
 
-Designed for the last 30 s, when the user is behind the camera and not looking at the
-screen. Optional and off-switchable: with `cfg.sound` false, `checkAlerts()` disarms
-everything and no audio node is created at all — not merely a muted gain.
+Designed for the last 90 s, when the user is getting behind the camera and then not
+looking at the screen. Optional and off-switchable: with `cfg.sound` false,
+`checkAlerts()` disarms everything and no audio node is created at all — not merely a
+muted gain.
 
 Two layers, deliberately split:
 
 - **`checkAlerts()`, 1 Hz, after `predict()`** decides *who* is counted down.
-  Arming is strict (`alertWorthy`: transit, trust high, `delta <= 3*angR`,
-  `tBest <= 30`). Staying armed is loose: up to 1.5 R and above the horizon, whatever
-  the trust. That hysteresis is intentional — a prediction flickering across 1.0 R or
-  a fix going briefly stale must not chop the countdown into pieces. A plane whose
-  closest approach is now or past (`tBest < 0.05`) disarms silently; anything else
-  that disarms (drifted past 1.5 R, or lost) plays the falling CALLED_OFF chime if it
-  had been announced and its tone has not played. The rising HEADS_UP chime is
-  retried every tick until audio is unlocked, then recorded in `alerted`.
+  Arming is strict (`alertWorthy`: transit, trust high, `delta0 <= 3*angR`,
+  `tBest <= ARM_S` = 90 s, the whole prediction window). `delta0` is the uncertainty
+  *without* the lead-time growth term: with `delta`, a plane 16 km out with the moon
+  at 40 deg read ±5.7 R at 90 s and ±3.1 R at 30 s, so it armed ~25 s ahead whatever
+  the horizon (the user asked for 90 s after hearing it start at 30). An early bet
+  that drifts is what the call-off is for. Staying armed is loose: up to 1.5 R and
+  above the horizon, whatever the trust. That hysteresis is intentional — a
+  prediction flickering across 1.0 R or a fix going briefly stale must not chop the
+  countdown into pieces. Anything that disarms off track (past 1.5 R or below the
+  horizon: drifted, turned, lost) plays the falling CALLED_OFF chime if it had been
+  announced and its tone has not played, and is dropped from `alerted`, so a plane
+  that comes back gets a fresh HEADS_UP. It is the miss that decides, not `tBest < 0.05` alone: a plane that
+  turns back has its closest approach *now*, and an earlier "passed → silent" rule
+  dropped exactly those without a sound. Only a pass within 1.5 R disarms silently.
+  The rising HEADS_UP chime is retried every tick until audio is unlocked, then
+  recorded in `alerted`.
 - **`countdownLoop()`, 20 Hz** turns the lead plane (earliest closest approach among
   `armed`) into sound on the AudioContext clock, committing at most `LOOKAHEAD_S`
   (0.12 s) ahead, so a changed prediction is heard within one blip. Blip spacing is
-  `beepGap(s) = clamp(s/10, 0.15, 2)`, re-derived on every pass against the *last*
-  blip, so the cadence tightens immediately rather than after a stale 2 s wait.
+  `beepGap(s) = clamp(s/10, 0.15, 5)` — the cadence says how long is left, and 90 s
+  of 2 s blips was a lot to sit through — re-derived on every pass against the
+  *last* blip, so the cadence tightens immediately rather than after a stale wait.
   `toneWindow()` holds a steady tone entry→exit, 0.35-5 s, centred on closest
   approach whenever it is clamped (a slow radial pass sat on the disc for ~8 s in
   testing, and an entry-anchored 3 s cap ended the tone before the best moment).
@@ -389,7 +399,8 @@ armed plane being "lost" and fire a CALLED_OFF chime each. The `alerted` pruning
 `cfg.soundVol` (1 / 3 / 6) multiplies every peak gain in `note()`, clamped to 0.5.
 The base levels were tuned for a quiet room; sun mode is usually outdoors in daylight,
 where the soft setting is inaudible. **Test sound** plays HEADS_UP, a compressed
-countdown and a tone (~4 s) and doubles as the gesture that unlocks `AudioContext` —
+countdown, a tone and then CALLED_OFF (~5.5 s; the chimes share one level), and
+doubles as the gesture that unlocks `AudioContext` —
 a cue you only discover is silent during the actual transit window is worthless.
 
 Browsers block `AudioContext` until a user gesture; `ensureAudio()` returns null while
@@ -453,18 +464,21 @@ so each node's `start(when)` logs `frequency.value` and `when` (and `stop` gives
 duration). Unlock audio with a *real* click on Test sound first — a scripted
 `.click()` is not a user gesture. Two complementary checks:
 
-- **Logic**, synchronous: clear `planes`/`mockWorld`, call `resetCountdown()`, insert
+- **Logic**, synchronous — `test/app.test.js` covers this with a recording fake
+  `AudioContext`; in a browser: clear `planes`/`mockWorld`, call `resetCountdown()`, insert
   fake planes `{hex, flight, ghosts: [], trail: [], klass, trust: 'high', pred: {at:
-  Date.now(), tBest, tMin, sepMin, delta, elMin: 10, azMin: 0, tIn: null, tOut: null,
+  Date.now(), tBest, tMin, sepMin, delta, delta0, elMin: 10, azMin: 0, tIn: null, tOut: null,
   samples: []}}` and call `checkAlerts()` between mutations. Expected: arm → 784,
   1046.5 (HEADS_UP); `sepMin` 1.2 R → still armed, silent; 2.0 R → 1046.5, 784
-  (CALLED_OFF); plane deleted → CALLED_OFF; `tBest = 0` → disarmed, silent; sound off →
-  disarmed, silent; 1.4 R or `tBest` 45 → never arms. Do not assign to globals like
+  (CALLED_OFF); `tBest = 0` with `sepMin` 40 R (turned back) → CALLED_OFF; back on
+  track → HEADS_UP again; plane deleted → CALLED_OFF; `tBest = 0` on the disc →
+  disarmed, silent; sound off → disarmed, silent; 1.4 R, `tBest` 95 or `delta0`
+  over 3 R → never arms. Do not assign to globals like
   `note` from the console — plain-script function declarations live on `window`.
   Reload afterwards: fake planes have no `lastSeen`, so `dropStalePlanes()` never
   removes them.
 - **Timing**, live: run `mock` for a minute and print the logged notes against the
-  arm/disarm times. Blips should run 2 s apart, tighten to 0.15 s, give way to one
+  arm/disarm times. Blips should run 5 s apart, tighten to 0.15 s, give way to one
   tone per pass, and resume for the next plane after the tone ends.
 
 When measuring the fan of ghost tracks, interpolate both curves to the same wall-clock

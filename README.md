@@ -145,18 +145,22 @@ Three things worth knowing up front:
 - **Sound cue** (optional; 🔊 button in the header, volume and test under ⚙) — a countdown you can follow with your
   eye on the viewfinder:
   1. **Heads-up**: a rising two-note chime when a plane becomes a *confident* transit
-     less than 30 s away (nominal path crosses the disc, data fresh and steady,
-     uncertainty under 3 radii). Alerted rows are marked with a note symbol.
-  2. **Countdown**: parking-sensor blips on one pitch, closer together as the pass
-     approaches — 2 s apart at 20 s and more, 1 s at 10 s, 0.5 s at 5 s, down to a
-     rapid 0.15 s in the last second and a half.
+     up to 90 s away (nominal path crosses the disc, data fresh and steady, the fix
+     good to 3 radii). Alerted rows are marked with a note symbol.
+  2. **Countdown**: parking-sensor blips on one pitch, a tenth of the time left
+     apart — every 5 s from 50 s out, 2 s at 20 s, 1 s at 10 s, 0.5 s at 5 s, down
+     to a rapid 0.15 s in the last second and a half.
   3. **On the disc**: a steady tone for as long as the plane is predicted to be in
      front of the disc (at least 0.35 s; for a very slow pass, the 5 s around
      closest approach). That is the "shoot now" signal. A near miss gets a short
      tone at closest approach instead.
-  4. **Called off**: a soft *falling* two-note chime if the prediction drifts to a
-     clear miss (beyond 1.5 radii) before the pass. Small wobbles around the edge of
-     the disc do not interrupt the countdown.
+  4. **Called off**: the same two notes *falling*, if the prediction drifts to a
+     clear miss (beyond 1.5 radii) before the pass — the plane turned, or dropped out
+     of the feed. Small wobbles around the edge of the disc do not interrupt the
+     countdown. A plane that comes back on track gets a fresh heads-up.
+
+  A heads-up 90 s out is an early bet: a minute and a half of straight-line dead
+  reckoning is plenty of time for a turn, so expect the occasional call-off.
 
   With several planes due, the countdown follows whichever passes first.
   Timing is only as good as the prediction: with a public feed a few seconds late,

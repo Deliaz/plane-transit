@@ -307,6 +307,9 @@ function predict(p, nowMs) {
     at: nowMs,                     // wall-clock ms that t = 0 refers to
     samples, tBest: best.t, tMin: Math.round(best.t),
     azMin: closest.az, elMin: closest.el, sepMin: best.sep, delta, tIn, tOut, dir,
+    // the same uncertainty without the extrapolation ahead: what the fix itself is
+    // good for at that range. The sound cue arms on this, not on `delta`
+    delta0: errAt(0, closest.range),
   };
   p.trust = (age < 6 && !p.maneuvering) ? 'high' : (age < 15 ? 'med' : 'low');
   // transit = nominal path crosses the disc; near = close pass, or a possible
@@ -1306,9 +1309,11 @@ $('btnSoundTest').addEventListener('click', () => {
     let t = ac.currentTime + 0.9, gap = 0.6;
     while (gap >= 0.15) { blip(ac, t); t += gap; gap *= 0.8; }
     holdTone(ac, t, 0.7);
+    chime(CALLED_OFF, 0.06, t - ac.currentTime + 1.5);   // and what a call-off sounds like
   }
   $('soundTestNote').textContent = ok
-    ? 'Played heads-up → countdown blips → on-disc tone. Too quiet? Pick a louder level and test again.'
+    ? 'Played heads-up → countdown blips → on-disc tone, then the called-off chime (a plane '
+      + 'that drifted off track). Too quiet? Pick a louder level and test again.'
     : 'No audio: the browser is blocking it, or this device has no output.';
 });
 document.addEventListener('click', ensureAudio);   // browsers need a gesture first
@@ -1375,19 +1380,20 @@ window.addEventListener('resize', drawPicker);
 
 // ---------- audio cue (optional) ----------
 // Built for the moment you are behind the camera and not looking at the screen.
-//  1. heads-up: a two-note chime when a plane first becomes a confident transit
-//     under 30 s out (once per plane);
-//  2. countdown: parking-sensor blips, one pitch, spacing shrinking with the time
-//     left (2 s apart at 20 s+, 1 s at 10 s, 0.5 s at 5 s, never under 0.15 s);
+//  1. heads-up: a rising two-note chime when a plane becomes a confident transit,
+//     up to ARM_S (90 s) out — again if it comes back after being called off;
+//  2. countdown: parking-sensor blips, one pitch, spaced a tenth of the time left
+//     (5 s apart at 50 s+, 2 s at 20 s, 0.5 s at 5 s, never under 0.15 s);
 //  3. on the disc: a steady tone held from predicted entry to exit — "shoot now";
-//  4. called off: a soft falling two-note if the prediction drifts to a clear miss
-//     before the pass, so silence never has to be interpreted.
+//  4. called off: the falling two-note if the prediction drifts to a clear miss
+//     before the pass — a turn, a lost plane — so silence never has to be interpreted.
 // cfg.sound off means no audio node is created at all; cfg.soundVol scales every
 // gain, because a level that is a gentle nudge indoors is inaudible outdoors.
 let audioCtx = null;
 const alerted = new Map();     // hex -> 1 once the heads-up has played (drives the ♪)
 const armed = new Set();       // hexes currently counted down
 const BEEP_HZ = 880;
+const ARM_S = PREDICT_S;       // heads-up this far ahead: the whole prediction window
 const LOOKAHEAD_S = 0.12;      // how far ahead the 50 ms scheduler commits sound
 const cd = { lastBeep: -Infinity, toneFor: null };   // countdown scheduler state
 
@@ -1420,10 +1426,10 @@ function note(ac, freq, when, dur, peak, attack, hold = false) {
   osc.start(when); osc.stop(when + dur + 0.02);
 }
 
-function chime(notes, peak) {
+function chime(notes, peak, delay = 0) {
   const ac = ensureAudio();
   if (!ac) return false;
-  for (const [freq, at] of notes) note(ac, freq, ac.currentTime + at, 0.55, peak, 0.05);
+  for (const [freq, at] of notes) note(ac, freq, ac.currentTime + delay + at, 0.55, peak, 0.05);
   return true;
 }
 const blip = (ac, when) => note(ac, BEEP_HZ, when, 0.07, 0.05, 0.008);
@@ -1431,8 +1437,9 @@ const holdTone = (ac, when, dur) => note(ac, BEEP_HZ, when, dur, 0.045, 0.02, tr
 const HEADS_UP = [[784, 0], [1046.5, 0.18]];
 const CALLED_OFF = [[1046.5, 0], [784, 0.16]];
 
-// seconds between blips, given seconds left until the tone starts
-function beepGap(sLeft) { return Math.min(2, Math.max(0.15, sLeft / 10)); }
+// seconds between blips, given seconds left until the tone starts: a tenth of it,
+// so the cadence itself says how long is left, up to one blip in 5 s far out
+function beepGap(sLeft) { return Math.min(5, Math.max(0.15, sLeft / 10)); }
 
 // When the tone plays, in prediction seconds: the nominal disc crossing, or just
 // closest approach for a near-miss. Clamped to 0.35-5 s, and always kept centred
@@ -1448,11 +1455,14 @@ function toneWindow(pr) {
 }
 
 // worth a sound = nominal path crosses the disc (moon or sun, whichever is the
-// current target), data is fresh and steady, and the uncertainty is small enough
-// to be a real bet rather than a coin flip
+// current target), data is fresh and steady, and the fix is good enough to be a
+// real bet rather than a coin flip. That last test leaves out the uncertainty that
+// grows with lead time (`delta0`, not `delta`): with it, a plane 16 km out, the
+// moon at 40 deg, armed only ~25 s ahead whatever ARM_S said. If an early bet
+// drifts, the called-off chime says so.
 function alertWorthy(p) {
   return p.klass === 'transit' && p.trust === 'high' &&
-    p.pred.delta <= 3 * target.angR && p.pred.tBest <= 30;
+    p.pred.delta0 <= 3 * target.angR && p.pred.tBest <= ARM_S;
 }
 
 function resetCountdown() {
@@ -1474,8 +1484,14 @@ function checkAlerts() {
     const stillOn = p && p.pred && p.pred.sepMin <= 1.5 * target.angR && p.pred.elMin > 0;
     if (passed || !stillOn) {
       armed.delete(hex);
-      // only a plane that was actually announced gets called off
-      if (!passed && alerted.has(hex) && cd.toneFor !== hex) chime(CALLED_OFF, 0.045);
+      // Only an announced plane is called off, and not one that passed on the disc.
+      // A plane turning away is "passed" too — its closest approach becomes now — so
+      // it is the miss, not the timing, that decides. Called off, it is forgotten:
+      // if it comes back on track, it gets a fresh heads-up.
+      if (!stillOn && alerted.has(hex) && cd.toneFor !== hex) {
+        chime(CALLED_OFF, 0.06);
+        alerted.delete(hex);
+      }
     }
   }
   pruneAlerted();   // after the disarm pass, which needs to know who was announced
