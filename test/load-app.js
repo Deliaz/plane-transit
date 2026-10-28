@@ -44,7 +44,7 @@ function loadApp() {
   };
   ctx.window = ctx;
   vm.createContext(ctx);
-  for (const f of ['astronomy.browser.min.js', 'geoid.js', 'app.js'])
+  for (const f of ['astronomy.browser.min.js', 'geoid.js', 'engine.js', 'app.js'])
     vm.runInContext(fs.readFileSync(path.join(ROOT, f), 'utf8'), ctx, { filename: f });
   // top-level const/let in those scripts are visible to later scripts in the context
   return code => vm.runInContext(code, ctx);

@@ -40,6 +40,9 @@ REMOTE_HOME=$(ssh "$HOST" 'echo $HOME')
 DIR="${PLANE_TRANSIT_DIR:-$REMOTE_HOME/plane-transit}"
 # Kept outside $DIR on purpose: rsync --delete would wipe a certificate living there.
 TLS_DIR="${PLANE_TRANSIT_TLS_DIR:-$REMOTE_HOME/.config/plane-transit/tls}"
+# The settings file (location, always-on switch), for the same reason; the unit makes
+# only this directory writable, so it must exist before the service starts.
+CONFIG_DIR="${PLANE_TRANSIT_CONFIG_DIR:-$REMOTE_HOME/.config/plane-transit/settings}"
 
 REMOTE_NODE=$(ssh "$HOST" 'command -v node || true')
 [ -n "$REMOTE_NODE" ] || die "node is not installed on $HOST (sudo apt install -y nodejs)"
@@ -55,7 +58,7 @@ say "shipping $REPO → $HOST:$DIR"
 git -C "$REPO" status --short | sed 's/^/    uncommitted: /' || true
 say "commit $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '(none)')"
 
-ssh "$HOST" "mkdir -p '$DIR'"
+ssh "$HOST" "mkdir -p '$DIR' '$CONFIG_DIR'"
 rsync -az --delete \
   --exclude '.git/' --exclude '.claude/' --exclude 'snap.png' --exclude 'node_modules/' \
   --exclude '.DS_Store' --exclude '*.local.md' --exclude 'docs/' --exclude 'test/' --exclude '.github/' \
@@ -65,6 +68,7 @@ REMOTE_USER=$(ssh "$HOST" 'id -un')
 say "installing $SERVICE unit (runs as $REMOTE_USER)"
 ssh "$HOST" "sed -e 's|__USER__|$REMOTE_USER|g' -e 's|__DIR__|$DIR|g' -e 's|__PORT__|$PORT|g' \
       -e 's|__LOCAL_URL__|$LOCAL_URL|g' -e 's|__TLS_DIR__|$TLS_DIR|g' -e 's|__TLS_PORT__|$TLS_PORT|g' \
+      -e 's|__CONFIG_DIR__|$CONFIG_DIR|g' \
       '$DIR/deploy/plane-transit.service' \
       | sudo tee /etc/systemd/system/$SERVICE.service >/dev/null
   sudo systemctl daemon-reload
@@ -85,4 +89,5 @@ if ssh "$HOST" "test -f '$TLS_DIR/server.crt'"; then
 else
   say "     no HTTPS yet: ./deploy/make-cert.sh sets it up"
 fi
+say "settings: $CONFIG_DIR/config.json (always-on: see DEPLOY.md)"
 say "logs: ssh $HOST journalctl -u $SERVICE -f"

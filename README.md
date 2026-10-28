@@ -55,14 +55,18 @@ All optional, as environment variables for `serve.js`:
 | `PLANE_TRANSIT_LOCAL_URL` | — | a local ADS-B receiver's `aircraft.json` to merge in (below) |
 | `PLANE_TRANSIT_TLS_DIR` | — | folder with `server.crt` + `server.key`; turns on https |
 | `PLANE_TRANSIT_TLS_PORT` | `8443` | https port |
+| `PLANE_TRANSIT_CONFIG` | `~/.config/plane-transit/settings/config.json` | the settings file (location, always-on) |
+| `PLANE_TRANSIT_CONFIG_READONLY` | — | `1`: pages can read the settings but not save them |
+| `PLANE_TRANSIT_WATCH` | — | `moon`, `moon,sun` or `off`: overrides the file's always-on switch |
 
 ### Keep it on your own network
 
 `serve.js` listens on every interface so a phone on the same wifi can use it. It has
-no login and proxies aircraft requests on your behalf, so **don't expose it to the
-internet** (no port forwarding). Upstream requests are capped at 10 per 10 s in total
-— adsb.fi's own limit — so a stranger reaching it can't push past that in your name, but
-there is nothing else to gain by making it public.
+no login, proxies aircraft requests on your behalf and lets any page on the network
+change the shared location, so **don't expose it to the internet** (no port
+forwarding). Upstream requests are capped at 5 per 10 s in total — half adsb.fi's
+limit — and 20,000 a day, so a stranger reaching it can't push past that in your name,
+but there is nothing else to gain by making it public.
 
 ### On a Raspberry Pi at home
 
@@ -80,8 +84,9 @@ Three things worth knowing up front:
   secure pages. It needs a small private CA installed once per device; it is
   name-constrained to your server so it cannot vouch for any other site. Steps are in
   DEPLOY.md, "HTTPS".
-- **It polls only while you are watching.** There is no polling timer: the page asks
-  the server, the server asks the aggregator. Close the page, hide it for a minute, or
+- **It polls only while you are watching** — unless you switch on always-on mode
+  (below). Otherwise there is no polling timer: the page asks the server, the server
+  asks the aggregator. Close the page, hide it for a minute, or
   point it at a target that is below the horizon, and nothing is requested at all —
   the header says why (`paused — page hidden`, `paused — moon below horizon`). Several
   tabs or devices at once still cost one upstream request per 2.5 s between them.
@@ -91,6 +96,66 @@ Three things worth knowing up front:
   backup, never a replacement: the public feed is the base list, a local fix takes over
   an aircraft only when it is more than 0.5 s fresher, aircraft the public feed misses
   are added, and if the public feed fails the page runs on the receiver alone.
+
+### Always-on mode (optional)
+
+By default nothing is fetched unless a page is open. To have the server keep watching
+on its own — to collect statistics, or to drive a notifier of your own through the API
+below — switch it on in the settings file (`~/.config/plane-transit/settings/config.json`,
+written the first time a page saves its location) and restart the server:
+
+```json
+"watch": { "enabled": true, "bodies": ["moon"] }
+```
+
+or set `PLANE_TRANSIT_WATCH=moon` (`moon,sun`, `off`). The page cannot switch it on:
+round-the-clock polling is a decision for whoever runs the box. It asks only as often as
+the sky calls for:
+
+| | polls |
+|---|---|
+| every watched body below `minEl` (10°) | not at all |
+| a body up, no plane heading for it | every 15 s (`idleS`) — each plane is still seen ~6 times before it could cross |
+| a plane predicted within ~2 disc radii | every 3 s (`burstS`) until its pass is over |
+| a page open on the same location | nothing extra: it reads the page's snapshots |
+
+That is roughly 5,000 requests a day with the moon watched, against adsb.fi's limit of
+86,400. Every request, the page's and the watcher's alike, goes through one budget: at
+most 5 per 10 s, 20,000 a day, and a pause of 30 s doubling up to 15 min after any
+refusal (adsb.fi counts refused requests against you, and may block an IP that keeps
+making them). Requests ask for gzip and name this project in their user agent.
+
+The sun is only watched if you name it. A prediction is not a safety device: never aim
+a camera at the sun without a certified front-mounted solar filter.
+
+### API for other programs
+
+Read-only, no login (another reason to keep the server on your own network):
+
+- **`GET /api/state`** — what the server's predictor sees right now: each watched body
+  (`az`, `el`, `angR` …), the tracked aircraft (`az`, `el`, `rangeM`, `altM`, `type` …),
+  and `passes`. It never contains the observer's position. A pass is one plane against
+  one body, tracked from a predicted miss of 5 disc radii:
+  - `id` — stable for the life of the pass; `status` — `upcoming`, then `passed`,
+    `called_off` (the prediction drifted away; usually a turn) or `lost` (gone from the
+    feed). Finished passes stay listed for 10 minutes with their final numbers, so a
+    reader polling every few seconds can't miss how one ended.
+  - `tca`, `tIn`, `tOut` — epoch ms of closest approach, disc entry and exit (`null`
+    when the nominal path misses the disc).
+  - `missR` — predicted miss in disc radii (≤ 1 is a transit); `errR` its uncertainty,
+    `err0R` the part that does not grow with lead time; `trust`, `fixAgeS`.
+  - `dir` (which way it crosses: 0° up, 90° right), `rangeM`, `altM`, `gs`, `flight`.
+  - `path` — predicted positions around closest approach, plus `now` and `closest`:
+    `x`/`y` in degrees from the body's centre (x right, y up), so `angR` is the disc.
+
+  `watch` says how the data is coming in (`mode`: `off`, `browser`, `paused`, `idle`,
+  `burst`; `dataAgeS`), and `bodies.<name>.watching` whether that body is up and the
+  data fresh — the denominator for any statistics. Without always-on mode the state is
+  only filled while a page is open on the same location. `v` is the format version.
+- **`GET /metrics`** — Prometheus text format: the server's own health (upstream
+  requests, refusals, back-off, polling mode and interval, data age, body elevations).
+  There are no pass statistics here; count passes from `/api/state`.
+- **`GET /api/status`** — the same counters as JSON, for a quick look.
 
 ## Use
 
@@ -108,8 +173,10 @@ Three things worth knowing up front:
   3. *Sound check* — pick soft / normal / loud and play the test, which also unlocks
      audio in the browser.
 
-  Everything is saved in this browser only and editable later under **⚙**. To fetch
-  planes, the position goes to the ADS-B service rounded to ~1 km.
+  Location, height and data source are saved on the server, so every device you
+  open it on shares them (and in this browser, as a copy); target, zoom and sound stay
+  per device. All of it is editable later under **⚙**. To fetch planes, the position
+  goes to the ADS-B service rounded to ~1 km.
 - **Target**: the ☾ Moon / ☀ Sun toggle in the header. Switching to the sun asks you to
   confirm a solar filter once per browser session. Everything else — prediction, tables, sound, map — works
   the same either way; the two discs are almost exactly the same apparent size (~0.53°),
@@ -237,7 +304,7 @@ Three things worth knowing up front:
 - Geoid: NGA's EGM96 model (public domain), sampled into `geoid.js`.
 
 These services are free because people run them for everyone; the server's request
-cap and its poll-only-while-watching design exist to keep it that way. If you build
+budget, its back-off and its poll-only-while-watching default exist to keep it that way. If you build
 on this for anything commercial, check their terms first — most of them don't allow it.
 
 ## Contributing

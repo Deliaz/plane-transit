@@ -36,5 +36,7 @@ jobs:
           for i in $(seq 20); do curl -fsS http://127.0.0.1:8321/api/status >/dev/null && break; sleep 0.5; done
           curl -fsS http://127.0.0.1:8321/ | grep -q '<title>'
           curl -fsS http://127.0.0.1:8321/api/status | grep -q '"ok": true'
+          curl -fsS http://127.0.0.1:8321/api/state | grep -q '"configured":false'
+          curl -fsS http://127.0.0.1:8321/metrics | grep -q '^plane_transit_watch_mode{mode="unconfigured"} 1$'
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8321/.git/config)" = 404
           test "$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:8321/%')" = 404

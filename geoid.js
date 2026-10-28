@@ -79,3 +79,5 @@ function geoidAt(lat, lon) {
   return (v(i, j) * (1 - fx) + v(i, j1) * fx) * (1 - fy)
        + (v(i + 1, j) * (1 - fx) + v(i + 1, j1) * fx) * fy;
 }
+// the server's always-on watcher needs the same model; in the page this is a no-op
+if (typeof module === 'object' && module.exports) module.exports = { geoidAt };

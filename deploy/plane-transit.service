@@ -14,16 +14,21 @@ Environment=PLANE_TRANSIT_LOCAL_URL=__LOCAL_URL__
 # HTTPS turns itself on once deploy/make-cert.sh has put a certificate here
 Environment=PLANE_TRANSIT_TLS_DIR=__TLS_DIR__
 Environment=PLANE_TRANSIT_TLS_PORT=__TLS_PORT__
+# Settings shared by every device, and the always-on switch (see DEPLOY.md)
+Environment=PLANE_TRANSIT_CONFIG=__CONFIG_DIR__/config.json
 ExecStart=/usr/bin/node __DIR__/serve.js
 Restart=on-failure
 RestartSec=5
 # Anything else on this box (an ADS-B feeder, say) matters more; stay out of its way.
 Nice=5
-# It serves files out of its own directory and talks HTTP. Nothing else.
+# It serves files out of its own directory, keeps its settings file, and talks HTTP.
+# Nothing else.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=read-only
+# ...except its settings directory, which must exist before it starts (deploy.sh makes it)
+ReadWritePaths=__CONFIG_DIR__
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6

@@ -22,8 +22,12 @@ session goes through the `#sunAck` dialog (tick "I have a filter", `sessionStora
 
 No build step, no package.json, no dependencies to install.
 
-- `index.html` — markup + all CSS. Settings UI writes to `localStorage["plane-transit-cfg"]`.
-  `cfg.body` (`'moon' | 'sun'`) defaults to `'moon'` when absent.
+- `index.html` — markup + all CSS. Settings UI writes to `localStorage["plane-transit-cfg"]`,
+  and the site part of it (`SITE_KEYS`: position, heights, geoid, source, radius, low
+  planes) also to the server's settings file through `PUT /api/config` (`pushSite()`,
+  debounced). At start-up `loadServerSite()` runs first: the server's site wins over
+  the browser's copy, and a server with none adopts this browser's. Target, zoom,
+  sound and map stay per device. `cfg.body` (`'moon' | 'sun'`) defaults to `'moon'` when absent.
   There is **no default location**: `cfg.lat/lon` start `null`, and until they are set
   the setup panel is open and `tick()` / `fetchLive()` do nothing (`hasLocation()`,
   `started`). A guessed location gives confidently wrong predictions, and a personal
@@ -35,11 +39,24 @@ No build step, no package.json, no dependencies to install.
   ground height up once from open-meteo.com (CORS-enabled; never while watching).
   Elevation is `groundM + aboveM` (terrain + eye above ground), kept in `cfg.elev`.
   Old saved settings without `groundM` are migrated at load (old `elev` → ground).
-- `app.js` — everything else: geodesy, prediction, both canvases, tables, audio.
+- `engine.js` — the maths, with no globals: geodesy, refraction, body positions,
+  aircraft ingestion (`aircraftFix`, `upsertPlane`), dead reckoning and `predictPlane`.
+  Loaded by the page as a plain script (`window.PlaneTransitEngine`) and by the server
+  with `require`; **both must make the same prediction, so prediction maths goes here,
+  never into app.js or watch.js.** It takes the observer as a `site` (`makeSite`) and the
+  body as a `target` (`bodyTarget`), and returns results rather than mutating the plane.
+- `app.js` — the page: canvases, tables, audio, settings. It keeps thin wrappers with
+  the old global names (`azElRange`, `sepAt`, `predict`, `updateTarget` …) over
+  engine.js, built from `cfg`/`observer`/`obsECEF` by `site()` on every call, so the
+  tests and the rest of the file read as before. `predict()` adds the page-only parts
+  (trail, ghost tracks) on top of `predictPlane()`.
+- `watch.js` — the server's watcher (see "Always-on mode and the API" below).
+- `config.js` — the settings file: load, validate, atomic save, `PLANE_TRANSIT_WATCH`.
 - `geoid.js` — EGM96 geoid heights on a 3° grid (~24 KB) and `geoidAt(lat, lon)`,
   generated from the NGA model (public domain) via egm96-universal. Within 2.7 m of
   the full model for 95% of the globe — a few metres is ~0.01 deg at 20 km, noise.
-- `serve.js` — static server, ADS-B proxy, shared snapshot cache, local-receiver merge.
+- `serve.js` — static server, ADS-B proxy, shared snapshot cache, local-receiver merge,
+  upstream budget, settings endpoint, `/api/state` and `/metrics`.
   Not optional (see CORS below). It serves only the files listed in `STATIC` — **a new
   file the page loads must be added there**, or it 404s. Serving the directory used to
   hand `.git/` and the deploy scripts to the whole LAN. The request handler must never
@@ -61,22 +78,32 @@ No build step, no package.json, no dependencies to install.
   origin means new `localStorage`: the https page opens the first-run setup again.
 
 Run with `node serve.js`. The README promises Node >= 14 and CI checks it, so **no
-global `fetch` in serve.js** (it arrived in Node 18) — it uses `https.get`.
-`PLANE_TRANSIT_PORT`, `PLANE_TRANSIT_BIND` and `PLANE_TRANSIT_LOCAL_URL` configure it. `require()`-ing
-serve.js starts nothing; the tests import `handle` and the merge helpers from it.
+global `fetch` in serve.js, watch.js, config.js or engine.js** (it arrived in Node 18),
+and no syntax newer than Node 14 there (`??`, `?.`, `||=`). `PLANE_TRANSIT_PORT`,
+`PLANE_TRANSIT_BIND`, `PLANE_TRANSIT_LOCAL_URL`, `PLANE_TRANSIT_CONFIG`,
+`PLANE_TRANSIT_CONFIG_READONLY` and `PLANE_TRANSIT_WATCH` configure it. `require()`-ing
+serve.js starts nothing (no timer, no settings read); the tests import `handle`, the
+merge helpers and the budget from it, and call `loadSettings()` themselves.
 
-**Nothing polls on a timer.** The browser drives everything: the client asks
-`/api/planes`, and only then does the server ask an aggregator. That is what makes the
-pi free to leave running — see the pause rules in `pollPause()` (hidden page past a
-60 s grace unless a countdown is armed; target below -2 deg) and the presence logging
-in serve.js. `cached()` gives every browser the same snapshot with one in-flight
-upstream request per key, so extra tabs and devices cost nothing. Keep it that way: an
-interval that fetches regardless of who is looking would quietly burn the quota.
-On top of that, `upstreamAllowed()` caps upstream at 10 requests per 10 s for the whole
-server (adsb.fi's published limit is 1/s): harmless for real use, and it stops a
-server exposed by mistake from being used to hammer the aggregator. The server also
-rounds lat/lon to 0.01 deg, as the page does, so a caller can't mint a cache key per
-metre.
+**Nothing polls on a timer unless always-on mode is switched on.** By default the
+browser drives everything: the client asks `/api/planes`, and only then does the server
+ask an aggregator. That is what makes the pi free to leave running — see the pause
+rules in `pollPause()` (hidden page past a 60 s grace unless a countdown is armed;
+target below -2 deg) and the presence logging in serve.js. `cached()` gives every
+browser the same snapshot with one in-flight upstream request per key, so extra tabs
+and devices cost nothing. The always-on watcher is the one deliberate exception, off by
+default, switched on only in the settings file, and paced by the sky (below). Keep it
+that way: an interval that fetches regardless of what there is to see would quietly
+burn the quota.
+
+**One upstream budget for everything** (`upstreamRefusal()`), browser and watcher
+alike: 5 requests per 10 s (half adsb.fi's published 1/s), 20,000 a day, and after any
+4xx a pause of 30 s doubling to 15 min (`upstreamResult()`), because adsb.fi counts
+refused requests against the limit and may block an IP that keeps making them.
+Timeouts and 5xx don't back off; the next poll is the retry. Requests send
+`Accept-Encoding: gzip` and a user agent naming the project (a plain one gets 403).
+The server also rounds lat/lon to 0.01 deg, as the page does, so a caller can't mint
+a cache key per metre.
 
 ## UI layout (what is used when)
 
@@ -96,9 +123,10 @@ Sorted by how often a photographer touches it, not by when it was built:
 - **Settings panel, rarely:** location, height, sound check; data source, radius,
   low planes and geoid under Advanced.
 
-**Privacy:** the position is stored only in the browser, and `fetchLive()` sends it
+**Privacy:** the position is stored in the browser and in the server's settings file
+(so that every device and the watcher share one setup), and `fetchLive()` sends it
 rounded to 0.01 deg with the radius padded by 1 nm — the aggregator gets the area,
-not the doorstep. `fetchGen` drops responses that were in flight across a
+not the doorstep. `/api/state` and `/metrics` never include it. `fetchGen` drops responses that were in flight across a
 `restartFetch()` (they used to mix real planes into mock mode).
 
 ## Conventions that are deliberate
@@ -291,6 +319,75 @@ show an honest uncertainty circle rather than a fake-confident line. Note that a
 error scales as 1/range: a close, low plane is inherently mushier than a cruising jet
 40 km out, and the display should keep saying so.
 
+## Always-on mode and the API
+
+`watch.js` runs the page's prediction on the server for the configured site and every
+watched body (`watch.bodies`; the sun only when named), once a second, and keeps the
+result for `/api/state`. It exists so other programs — dashboards, notifiers — can
+build on the predictions without a browser and without re-implementing them. It is
+deliberately **only a reporter**: no statistics, no history, no notifications in this
+repo. Consumers count passes from the state; the server keeps nothing on disk but the
+settings.
+
+Data comes in two ways, both through `snapshot()` in serve.js and so through the shared
+cache and the one budget:
+
+- **Peek, every tick:** a public snapshot someone else (a browser) already fetched for
+  the same cache key, newer than the last one ingested. Never a request of its own.
+  `feedParams()` builds the key exactly as the page does (`radiusNm + 1`, 0.01 deg),
+  so a page open on the shared settings feeds the watcher for free.
+- **Fetch, only with `watch.enabled`:** when what it has is older than the pace asks
+  for. `decide()` sets the pace: `paused` (no request) while every watched body is
+  below `minEl`; `idle`, `idleS` (15 s) while one is up; `burst`, `burstS` (3 s) while
+  an upcoming pass has `missR <= 2` or `missR <= 1 + err0R`. Use `err0R`, not `errR`:
+  the latter grows with lead time and put every plane within ~15 km into burst a
+  minute out. With a browser polling the same key it waits an extra 2 s before
+  fetching, or it jumps into the half-second gap between the page's 3 s polls and
+  the 2.5 s cache (measured: 2 extra requests per 30 s before that slack).
+
+15 s idle is enough to see every pass coming: the window is 90 s, so a plane is seen
+~6 times before its closest approach. The burst sharpens the timing of the crossing,
+and costs ≤ 30 requests per pass. Expect ~5,000 requests a day watching the moon.
+
+**Passes** (`updatePasses()`), keyed `body|hex`. Created when a prediction has a real
+minimum ahead (`realMin`), the body up at it, and `missR <= PASS_R` (5). Updated every
+tick while upcoming. They end as:
+
+- `passed` — closest approach reached (`tBest` no longer a real minimum) at or after
+  the last predicted `tca` (3 s slack), or the plane left the feed after its `tca`;
+- `called_off` — prediction drifted past `CALL_OFF_R` (6; the gap to 5 is hysteresis),
+  or closest approach jumped to "now" well before the predicted `tca` (a turn away —
+  the same rule as the page's audio: the timing, not the miss, tells a pass from a turn);
+- `lost` — gone from the feed (30 s stale) before its `tca`, or the body set.
+
+A finished pass keeps the numbers of its **last upcoming prediction** — the shortest
+lead, the best — not the post-pass ones, where `sepMin` is just the current separation
+growing. Finished passes stay in the state `RECENT_MS` (10 min), so a reader polling
+every few seconds sees every ending; `id` (`body-hex-firstSeenSeconds`) lets it count
+each once. A plane called off and then back on track is a new pass with a new id.
+
+**`/api/state` format** (`v: 1`; change `v` if you break it): `watch` (mode, reason,
+interval, `dataAgeS`, error), `bodies.<b>` (az/el/angR/rates/illum/limb, `watching` =
+up past `minEl` with data under 30 s old — the denominator for statistics; the sun's
+entry carries a filter warning), `aircraft` (az/el/range from the observer, never
+lat/lon), `passes` (times as epoch ms; `missR`/`errR`/`err0R` in disc radii; `path`,
+`now`, `closest` as `x`/`y` degrees from the body's centre in the sky view's frame, x
+right along azimuth × cos el, y up). **No observer position anywhere in it** — a test
+checks.
+
+**`/metrics`** is the service's health in Prometheus text format (requests, refusals,
+back-off, mode, interval, data age, body elevations). Pass counts do not belong there;
+they are a consumer's business.
+
+**Settings** (`config.js`): `site` is what the page's setup writes; `watch` is only ever
+written by hand (or overridden by `PLANE_TRANSIT_WATCH`, which is never saved back —
+serve.js keeps `fileWatch` apart for that). `PUT /api/config` takes `{site}` only,
+JSON only (a cross-origin page would need a preflight the server never answers),
+16 KB max. Everything is clamped on the way in and out, so a hand edit with a typo
+falls back to defaults. The file is in its own directory because the unit makes only
+that directory writable (`ReadWritePaths`), and an atomic save needs a temporary file
+beside it.
+
 ## Data providers (state as of Sep 2026)
 
 Browsers cannot call these APIs directly — **none send CORS headers**. That is the
@@ -307,7 +404,11 @@ line shows. A plain user agent gets **403** from adsb.fi — always send one.
 
 Parsing traps: the aircraft-list key differs per provider (`ac` vs `aircraft`, both
 handled); `alt_baro` can be the **string** `"ground"`; `gs`/`track` are missing on some
-records. Rate limiting is real — a 429 triggers a 15 s client-side backoff.
+records. Rate limiting is real — a 429 triggers a 15 s client-side backoff, and the
+server's own back-off (above) stops it asking upstream at all for a while. adsb.fi's
+terms (checked Oct 2026): 1 request per second, personal non-commercial use,
+attribution with a link (the page footer has it); refused requests count against the
+limit and can earn a temporary IP block.
 
 **Measured 20 Sep 2026** (30 nm around one home antenna, vs adsb.fi):
 
@@ -432,9 +533,13 @@ every push, plus a Node 14 start-up check of serve.js). `test/load-app.js` runs
 `astronomy.browser.min.js`, `geoid.js` and `app.js` in a `vm` sandbox where every DOM
 lookup returns an inert stub, so the maths can be called directly: `parseLatLon`,
 `geoidAt`, `refrShare`, `predict` (including the sub-second refinement and the
-dead-reckoned "now"), the tone window and the arming rules. `test/serve.test.js` covers
+dead-reckoned "now"), the tone window and the arming rules — through app.js's
+wrappers, so they test engine.js as the page uses it. `test/serve.test.js` covers
 the static allowlist, bad requests, `/api/snap`'s guards, `mergeFeeds` and the upstream
-cap; it never contacts an aggregator. If you add top-level code to app.js that needs a
+cap; `test/api.test.js` the settings endpoint, `/api/state`, `/metrics`, the back-off,
+the daily ceiling, gzip and the user agent; `test/watch.test.js` the watcher's pacing
+and pass lifecycle against a fake feed and clock (a synthetic plane aimed at the
+moon), and settings validation. None of them contacts an aggregator. If you add top-level code to app.js that needs a
 real value from the DOM at load time, the stub may need teaching about it.
 
 **`mock` source** spawns synthetic planes deliberately aimed at the target (some hit,

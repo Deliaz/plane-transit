@@ -46,10 +46,17 @@ It ships the **working tree**, uncommitted changes included (that is deliberate 
 will want to fix something between two passes), and prints the git state so you know
 what went out. It installs into `~/plane-transit` on the box. Overrides: `PLANE_TRANSIT_HOST`,
 `PLANE_TRANSIT_DIR`, `PLANE_TRANSIT_PORT`, `PLANE_TRANSIT_LOCAL_URL`, `PLANE_TRANSIT_TLS_DIR`,
-`PLANE_TRANSIT_TLS_PORT`.
+`PLANE_TRANSIT_TLS_PORT`, `PLANE_TRANSIT_CONFIG_DIR`.
 
 The unit is `deploy/plane-transit.service`, installed to `/etc/systemd/system/` with the
 `__PLACEHOLDERS__` substituted. It is enabled, so it survives reboots.
+
+The settings file lives in `~/.config/plane-transit/settings/config.json`, outside the
+install directory (a redeploy's `rsync --delete` would wipe it otherwise). The first page
+to save a location creates it, and every device shares it from then on. The unit runs
+with a read-only home directory except for that folder, which therefore has to exist
+before the service starts: `deploy.sh` creates it. Install the unit some other way and
+`mkdir -p` it yourself, or the service fails with `226/NAMESPACE`.
 
 ```
 ssh pi journalctl -u plane-transit -f          # logs, including the active/idle transitions
@@ -63,8 +70,9 @@ session keeps it awake. Not a Plane Transit problem; just retry.
 
 ## Why it costs nothing when you are not using it
 
-There is no polling timer anywhere. The browser asks the server, the server asks the
-aggregator, and nothing asks when nobody is watching:
+Unless always-on mode is switched on (next section), there is no polling timer
+anywhere. The browser asks the server, the server asks the aggregator, and nothing asks
+when nobody is watching:
 
 - **Page closed** → no requests at all.
 - **Page hidden** (background tab, screen off) for more than 60 s → the browser stops
@@ -78,13 +86,42 @@ aggregator, and nothing asks when nobody is watching:
 
 `/api/status` shows `active`, `idleFor`, `clientReqs` vs `upstreamReqs` and
 `sharedHits`, so you can check the aggregator is genuinely not being hit, and
-`upstreamLimited` counts requests refused by the 10-per-10-s cap (normally 0).
+`upstreamLimited` counts requests the server's own budget kept back (5 per 10 s,
+20,000 a day, and the pause after a refusal; normally 0).
 
 One consequence of sharing a snapshot: it can be up to 2.5 s old when a second browser
 gets it, and the aggregator's `seen_pos` was measured before that. The server adds the
 cache age back on before answering (`_meta.cacheAgeS` shows how much), because the
 browser dead-reckons from that timestamp — an unaged fix would quietly shift the plane
 by speed × cache age, ~500 m for an airliner.
+
+## Always-on mode
+
+For statistics, or a notifier of your own reading `/api/state`, the server can keep
+watching without a browser. Switch it on in the settings file on the box and restart:
+
+```
+ssh pi nano ~/.config/plane-transit/settings/config.json
+#   "watch": { "enabled": true, "bodies": ["moon"], "minEl": 10, "idleS": 15, "burstS": 3 }
+ssh pi sudo systemctl restart plane-transit
+```
+
+(`"bodies": ["moon", "sun"]` to watch both; the sun is never watched unless named.)
+It needs a location, so open the page once if the file has no `site` yet. The log says
+what it is doing as it changes pace:
+
+```
+always-on: idle, every 15 s — watching moon
+always-on: burst, every 3 s — a plane is heading for the disc
+always-on: paused — moon below 10°
+```
+
+The pacing is in the README ("Always-on mode"): nothing while the watched bodies are
+below `minEl`, every 15 s while one is up, every 3 s while a plane is heading for the
+disc, and nothing extra while a page is open on the same location. Expect roughly 5,000
+upstream requests a day with the moon watched; `curl -s …/metrics | grep upstream`
+shows the running totals. The daily ceiling (20,000) and the back-off after a refusal
+hold whatever the settings say.
 
 ## The local receiver (addition and backup, never a replacement)
 

@@ -14,8 +14,15 @@ an answer within a week.
   the same wifi can reach it. Do not expose it to the internet. Set
   `PLANE_TRANSIT_BIND=127.0.0.1` to keep it to one machine.
 - It serves only the page's own files, never the rest of the checkout.
-- It proxies ADS-B requests to public aggregators, capped at 10 requests per 10 s in
-  total, with the observer position rounded to about 1 km.
+- It proxies ADS-B requests to public aggregators, capped at 5 requests per 10 s and
+  20,000 a day in total, with the observer position rounded to about 1 km.
+- `PUT /api/config` lets any page on the network change the shared location and data
+  source (JSON only, so a page on another site cannot send it without a CORS preflight,
+  which the server never answers). It cannot switch on always-on polling; that is only
+  in the settings file. `PLANE_TRANSIT_CONFIG_READONLY=1` turns saving off.
+- `/api/state` and `/metrics` are read-only. They never include the observer's
+  position, though the directions to the moon, the sun and nearby aircraft narrow it
+  down for anyone who can read them.
 - `/api/snap` (a development aid that writes one PNG next to the sources) answers
   only requests from the same machine, only with an `image/png` body, up to 20 MB.
 
@@ -26,6 +33,7 @@ script. A weakness in that design — anything that would let the CA vouch for a
 outside its constraints, or move its key onto the server — is exactly the kind of
 report we want.
 
-Your position is stored only in your browser. It is sent, rounded to ~1 km, to the
-ADS-B aggregator you choose, and to four decimals (~10 m) to open-meteo.com once when
+Your position is stored in your browser and in the server's settings file
+(`~/.config/plane-transit/settings/config.json` on the machine running it). It is sent,
+rounded to ~1 km, to the ADS-B aggregator you choose, and to four decimals (~10 m) to open-meteo.com once when
 you set it, to look up the ground height.

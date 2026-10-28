@@ -37,15 +37,50 @@ if (!Number.isFinite(cfg.geoidM)) cfg.geoidM = 0;
 if (cfg.showMap == null) cfg.showMap = window.innerWidth > 800;
 function saveCfg() {
   try { localStorage.setItem(LS_KEY, JSON.stringify(cfg)); } catch (e) { /* private mode */ }
+  pushSite();
 }
 
-const PREDICT_S = 90;          // dead-reckoning horizon, seconds
+// Where you stand and which feed to use also live on the server (/api/config), so
+// every device — and the server's always-on watcher — shares one setup. This
+// browser keeps a copy, which is all there is when the server has none to give.
+// Per-device choices (target, zoom, sound, map) stay in this browser only.
+const SITE_KEYS = ['lat', 'lon', 'groundM', 'aboveM', 'geoidAuto', 'geoidM', 'source', 'radiusNm', 'includeLow'];
+const siteBody = () => JSON.stringify({ site: Object.fromEntries(SITE_KEYS.map(k => [k, cfg[k]])) });
+const serverSite = { writable: false, sent: '' };   // sent: the last site the server has
+let pushTimer = null;
+function pushSite() {
+  if (!serverSite.writable || !hasLocation() || siteBody() === serverSite.sent) return;
+  clearTimeout(pushTimer);
+  pushTimer = setTimeout(() => {
+    const body = siteBody();
+    serverSite.sent = body;
+    fetch('/api/config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body,
+      signal: AbortSignal.timeout(5000) })
+      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); })
+      .catch(e => { serverSite.sent = ''; console.warn('settings not saved on the server:', e.message); });
+  }, 400);
+}
+// The server's site wins over this browser's copy. A server without one adopts this
+// browser's, through applyCfg() → saveCfg() → pushSite() once start-up runs.
+async function loadServerSite() {
+  try {
+    const r = await fetch('/api/config', { signal: AbortSignal.timeout(4000) });
+    if (!r.ok) return;
+    const c = await r.json();
+    serverSite.writable = !!c.writable;
+    if (!c.site) return;
+    for (const k of SITE_KEYS) if (k in c.site) cfg[k] = c.site[k];
+    serverSite.sent = siteBody();
+  } catch (e) { /* no server settings: this browser's own, as before */ }
+}
+
+// The maths lives in engine.js, shared with the server's always-on watcher.
+const PTE = PlaneTransitEngine;
+const { PREDICT_S, D2R, R2D, geodeticToECEF, refrShare, wrapDeg, angularSep, planeAt, realMin } = PTE;
 const HIDDEN_GRACE_MS = 60000; // keep polling this long after the page is hidden
 const BELOW_HORIZON_DEG = -2;  // target this far down = nothing to photograph
 const GHOST_S = 10;            // how long a superseded fix's predicted track stays visible
 const FETCH_MS = 3000;
-const KM_PER_AU = 149597870.7;
-const FT = 0.3048, KT = 0.514444, FPM = 0.00508;
 
 // Everything that differs between the two targets lives here; the rest of the
 // tool only talks to `target`, which is whichever one is selected. The two
@@ -57,7 +92,7 @@ const FT = 0.3048, KT = 0.514444, FPM = 0.00508;
 // sepia, sand, faded-ink reds), so the two modes are never mistaken for each other.
 const BODIES = {
   moon: {
-    label: 'Moon', engine: 'Moon', radiusKm: 1737.4,
+    ...PTE.BODIES.moon,
     disc: '#f5e9c8', accent: '#ffd97a', glow: null, hasIllum: true,   // glow: "r,g,b"
     sky: {
       grid: '#1d2431', gridText: '#5a6377',
@@ -70,7 +105,7 @@ const BODIES = {
     },
   },
   sun: {
-    label: 'Sun', engine: 'Sun', radiusKm: 695700,
+    ...PTE.BODIES.sun,
     disc: '#ffd24a', accent: '#f0b429', glow: '255,190,60', hasIllum: false,
     sky: {
       grid: '#302416', gridText: '#836d47',
@@ -95,244 +130,49 @@ let srcStatus = { ok: false, msg: 'connecting…', t: 0 };
 let mockWorld = [];            // truth records for mock planes
 
 // ---------- geodesy ----------
-const D2R = Math.PI / 180, R2D = 180 / Math.PI;
-const WGS_A = 6378137, WGS_E2 = 6.69437999014e-3;
-
-function geodeticToECEF(lat, lon, h) {
-  const s = Math.sin(lat * D2R), c = Math.cos(lat * D2R);
-  const sl = Math.sin(lon * D2R), cl = Math.cos(lon * D2R);
-  const N = WGS_A / Math.sqrt(1 - WGS_E2 * s * s);
-  return [(N + h) * c * cl, (N + h) * c * sl, (N * (1 - WGS_E2) + h) * s];
-}
-// Aircraft GNSS heights (alt_geom) are above the WGS84 ellipsoid; the observer's
-// elevation is entered above sea level. Around Amsterdam sea level sits ~43 m above
-// the ellipsoid, and skipping that put the observer 43 m low — every plane drawn
-// 43 m / range too high (0.12 deg at 20 km, half a disc radius).
+// The observer as engine.js wants it, from the settings. Rebuilt per call: cheap, and
+// it can never go stale against cfg/observer/obsECEF.
 const obsHeight = () => cfg.elev + cfg.geoidM;
 let obsECEF = hasLocation() ? geodeticToECEF(cfg.lat, cfg.lon, obsHeight()) : null;
-
-// Refraction. Sun/moon light crosses the whole atmosphere and is lifted by the full
-// astronomical refraction (~10' at 5 deg elevation). A plane's light only crosses
-// the air below it, so it gets a fraction: for refractivity falling off
-// exponentially with scale height H, a target dh above the observer is lifted by
-//   f(x) = 1 - e^-x - (1 - e^-x (1+x)) / x,   x = dh / H
-// of the full amount — ~6% at 1 km, ~17% at 3 km, ~43% at 10 km. The old
-// "refraction cancels" shortcut left low planes ~0.15 deg too high vs a low target.
-const REFR_SCALE_M = 8000;
-function refrShare(dh) {
-  const x = Math.max(dh, 1) / REFR_SCALE_M, e = Math.exp(-x);
-  return 1 - e - (1 - e * (1 + x)) / x;
-}
-
-// apparent az/el and range of a point at ellipsoidal height h, from the observer
-function azElRange(lat, lon, h) {
-  const [x, y, z] = geodeticToECEF(lat, lon, h);
-  const dx = x - obsECEF[0], dy = y - obsECEF[1], dz = z - obsECEF[2];
-  const sf = Math.sin(cfg.lat * D2R), cf = Math.cos(cfg.lat * D2R);
-  const sl = Math.sin(cfg.lon * D2R), cl = Math.cos(cfg.lon * D2R);
-  const E = -sl * dx + cl * dy;
-  const N = -sf * cl * dx - sf * sl * dy + cf * dz;
-  const U = cf * cl * dx + cf * sl * dy + sf * dz;
-  const range = Math.hypot(E, N, U);
-  const el = Math.asin(U / range) * R2D;
-  return {
-    az: (Math.atan2(E, N) * R2D + 360) % 360,
-    el: el + Astronomy.Refraction('normal', el) * refrShare(h - obsHeight()),
-    range,
-  };
-}
-
-// inverse: point at az/el/range from observer -> geodetic (used by mock mode).
-// Geometric: it ignores the plane's small refraction lift, so mock aim points sit
-// a few arcminutes high at low elevation. Harmless for a demo.
-function pointAt(az, el, range) {
-  const E = range * Math.cos(el * D2R) * Math.sin(az * D2R);
-  const N = range * Math.cos(el * D2R) * Math.cos(az * D2R);
-  const U = range * Math.sin(el * D2R);
-  const lat = cfg.lat + (N / 111320);
-  const lon = cfg.lon + (E / (111320 * Math.cos(cfg.lat * D2R)));
-  // curvature correction: a level path drops below the tangent plane
-  const h = obsHeight() + U + (E * E + N * N) / (2 * 6371e3);
-  return { lat, lon, h };
-}
-
-function wrapDeg(d) { return ((d + 540) % 360) - 180; }
-
-function angularSep(az1, el1, az2, el2) {
-  const s = Math.sin(el1 * D2R) * Math.sin(el2 * D2R) +
-    Math.cos(el1 * D2R) * Math.cos(el2 * D2R) * Math.cos((az1 - az2) * D2R);
-  return Math.acos(Math.min(1, Math.max(-1, s))) * R2D;
-}
+const site = () => ({ lat: cfg.lat, lon: cfg.lon, elev: cfg.elev, geoidM: cfg.geoidM,
+  h: obsHeight(), observer, ecef: obsECEF });
+const azElRange = (lat, lon, h) => PTE.azElRange(site(), lat, lon, h);
+const pointAt = (az, el, range) => PTE.pointAt(site(), az, el, range);
 
 // ---------- target body (moon or sun) ----------
-function bodyAzEl(date, key = cfg.body) {
-  const eq = Astronomy.Equator((BODIES[key] || BODIES.moon).engine, date, observer, true, true);
-  const hor = Astronomy.Horizon(date, observer, eq.ra, eq.dec);   // geometric
-  const el = hor.altitude + Astronomy.Refraction('normal', hor.altitude);   // as seen
-  return { az: hor.azimuth, el, distKm: eq.dist * KM_PER_AU };
-}
-
-function updateTarget(now) {
-  const B = body();
-  const a = bodyAzEl(now);
-  const b = bodyAzEl(new Date(now.getTime() + 120000));
-  target = {
-    az: a.az, el: a.el,
-    angR: Math.asin(B.radiusKm / a.distKm) * R2D,
-    azRate: wrapDeg(b.az - a.az) / 120,
-    elRate: (b.el - a.el) / 120,
-    // phase is meaningless for the sun, so that header stat is hidden there
-    illum: B.hasIllum
-      ? Astronomy.Illumination(Astronomy.Body[B.engine], now).phase_fraction : null,
-    limb: B.hasIllum ? limbAngle(a, bodyAzEl(now, 'sun')) : null,
-  };
-}
-// Direction of the sun as seen from the target, in the sky view's own frame: degrees
-// from "up" (towards the zenith) towards increasing azimuth (screen right). The bright
-// limb faces it, so this orients the phase. Great-circle bearing, with el as latitude
-// and az as longitude; fine with the sun below the horizon.
-function limbAngle(m, s) {
-  const e1 = m.el * D2R, e2 = s.el * D2R, dA = wrapDeg(s.az - m.az) * D2R;
-  return Math.atan2(Math.sin(dA) * Math.cos(e2),
-    Math.cos(e1) * Math.sin(e2) - Math.sin(e1) * Math.cos(e2) * Math.cos(dA)) * R2D;
-}
-function targetAt(tSec) { // linear over the prediction window (fine for <2 min)
-  return { az: target.az + target.azRate * tSec, el: target.el + target.elRate * tSec };
-}
+const bodyAzEl = (date, key = cfg.body) => PTE.bodyAzEl(site(), key, date);
+function updateTarget(now) { target = PTE.bodyTarget(site(), cfg.body, now); }
+const targetAt = tSec => PTE.targetAt(target, tSec);
 
 // ---------- plane ingestion ----------
 function upsertPlane(hex, flight, lat, lon, altM, gs, track, vr, ageS, altSrc, feed) {
-  let p = planes.get(hex);
-  if (!p) { p = { hex, hist: [], trail: [], ghosts: [] }; planes.set(hex, p); }
-  // maneuver detection from recent track / vertical-rate changes
-  const last = p.hist[p.hist.length - 1];
-  if (!last || last.track !== track || last.vr !== vr) {
-    p.hist.push({ track, vr, t: Date.now() });
-    if (p.hist.length > 4) p.hist.shift();
-  }
-  let maneuvering = false;
-  for (let i = 1; i < p.hist.length; i++) {
-    if (Math.abs(wrapDeg(p.hist[i].track - p.hist[i - 1].track)) > 4 ||
-        Math.abs(p.hist[i].vr - p.hist[i - 1].vr) > 3) maneuvering = true;
-  }
-  // A poll that returns the same position again still re-derives its timestamp
-  // from seen_pos, and network latency makes that jitter by up to ~1 s — enough to
-  // shove the dot and its line along by a second of flight. Latency can only make a
-  // fix look newer than it is, so the earliest estimate of a given fix is the best.
-  const now = Date.now(), posTime = now - ageS * 1000;
-  const sameFix = p.lat === lat && p.lon === lon && p.altM === altM;
-  Object.assign(p, {
-    flight: (flight || hex).trim(), lat, lon, altM, altSrc, feed, gs, track, vr,
-    posTime: sameFix ? Math.min(p.posTime, posTime) : posTime,
-    lastSeen: now, maneuvering,
-  });
+  PTE.upsertPlane(planes, { hex, flight, lat, lon, altM, gs, track, vr, ageS, altSrc, feed }, Date.now());
 }
-
-function dropStalePlanes() {
-  const now = Date.now();
-  for (const [hex, p] of planes)
-    if (now - p.lastSeen > 30000) planes.delete(hex);
-}
-
-// dead-reckoned geodetic position of plane p at ageS seconds after its fix
-function planeAt(p, dtS) {
-  const vN = p.gs * Math.cos(p.track * D2R), vE = p.gs * Math.sin(p.track * D2R);
-  const lat = p.lat + vN * dtS / 111320;
-  const lon = p.lon + vE * dtS / (111320 * Math.cos(p.lat * D2R));
-  return { lat, lon, h: p.altM + p.vr * dtS };
-}
+function dropStalePlanes() { PTE.dropStalePlanes(planes, Date.now()); }
 
 // ---------- prediction ----------
-// where plane p is t s from now (its fix being `age` s old), and how far that is
-// from where the target will be at the same moment
-function sepAt(p, age, t) {
-  const pos = planeAt(p, age + t);
-  const ae = azElRange(pos.lat, pos.lon, pos.h);
-  const m = targetAt(t);
-  ae.sep = angularSep(ae.az, ae.el, m.az, m.el);
-  return ae;
-}
+const sepAt = (p, age, t) => PTE.sepAt(site(), target, p, age, t);
 
 function predict(p, nowMs) {
-  const age = (nowMs - p.posTime) / 1000;
-  // Everything drawn as "now" is the dead-reckoned position, never the raw fix.
-  // The fix is `age` s old; drawing it left the dot behind the start of its own
-  // predicted line by age × speed — degrees, for a close plane with a stale fix.
-  const cur = sepAt(p, age, 0);
-  p.az = cur.az; p.el = cur.el; p.range = cur.range; p.sepNow = cur.sep;
-  p.age = age;
-
-  p.trail.push({ az: cur.az, el: cur.el, t: nowMs });
+  Object.assign(p, PTE.predictPlane(site(), target, p, nowMs));
+  if (!p.trail) { p.trail = []; p.ghosts = []; }
+  p.trail.push({ az: p.az, el: p.el, t: nowMs });
   while (p.trail.length && nowMs - p.trail[0].t > 20000) p.trail.shift();
-
-  // ADS-B velocity is good to ~1-2 m/s in steady flight; turns are the real risk
-  const growth = p.maneuvering ? 25 : 3;    // m per second of extrapolation
-  const errAt = (t, range) => Math.atan2(60 + p.gs * 0.3 + growth * (age + t), range) * R2D;
-  const samples = [];
-  let best = null;
-  for (let t = 0; t <= PREDICT_S; t += 1) {
-    const s = sepAt(p, age, t);
-    if (t % 2 === 0) samples.push({ t, az: s.az, el: s.el, range: s.range, delta: errAt(t, s.range) });
-    if (!best || s.sep < best.sep) best = { t, sep: s.sep };
-  }
-  // Refine to 0.05 s around the coarse minimum. At 1 s steps a close jet moves
-  // ~1.8 deg per step against a 0.53 deg disc, so a dead-centre transit landing
-  // between two samples was reported as a 1.4 R near miss — and made no sound.
-  const t0 = best.t;
-  for (let i = -20; i <= 20; i++) {
-    const t = t0 + i * 0.05;
-    if (t < 0 || t > PREDICT_S) continue;
-    const sep = sepAt(p, age, t).sep;
-    if (sep < best.sep) best = { t, sep };
-  }
-  const closest = sepAt(p, age, best.t);
-  const r = target.angR;
-  // nominal disc entry / exit, to 0.02 s: the audio cue holds a tone between them.
-  // Searched no further than the tone can reach (toneWindow caps it at ±2.5 s).
-  let tIn = null, tOut = null;
-  if (best.sep <= r) {
-    tIn = tOut = best.t;
-    while (tIn > best.t - 2.5 && sepAt(p, age, tIn - 0.02).sep <= r) tIn -= 0.02;
-    while (tOut < best.t + 2.5 && sepAt(p, age, tOut + 0.02).sep <= r) tOut += 0.02;
-  }
-  const delta = errAt(best.t, closest.range);
-  // Which way the plane crosses the sky at closest approach, relative to the target
-  // (the camera follows it): degrees from "up" towards screen right, the sky view's
-  // own frame. With the plane off screen, this is what says which side of the frame
-  // it will come in from — the opposite one.
-  const a = sepAt(p, age, best.t - 0.5), b = sepAt(p, age, best.t + 0.5);
-  const dir = Math.atan2(wrapDeg(b.az - a.az) * Math.cos(closest.el * D2R) - target.azRate * Math.cos(target.el * D2R),
-    b.el - a.el - target.elRate) * R2D;
-  p.pred = {
-    at: nowMs,                     // wall-clock ms that t = 0 refers to
-    samples, tBest: best.t, tMin: Math.round(best.t),
-    azMin: closest.az, elMin: closest.el, sepMin: best.sep, delta, tIn, tOut, dir,
-    // the same uncertainty without the extrapolation ahead: what the fix itself is
-    // good for at that range. The sound cue arms on this, not on `delta`
-    delta0: errAt(0, closest.range),
-  };
-  p.trust = (age < 6 && !p.maneuvering) ? 'high' : (age < 15 ? 'med' : 'low');
-  // transit = nominal path crosses the disc; near = close pass, or a possible
-  // transit once position uncertainty is taken into account
-  p.klass = (best.sep <= r && closest.el > 0) ? 'transit'
-          : ((best.sep <= 3 * r || best.sep <= r + delta) && closest.el > 0) ? 'near' : 'far';
 
   // Prediction history. Each distinct fix gives its own track, fixed in wall-clock
   // time; tracks from the last GHOST_S seconds are drawn fading behind the current
   // one. A steady plane's tracks lie on top of each other; feed jitter or a turn
   // fans them out — the spread is the deviation you can actually see.
+  const pr = p.pred;
   const fixKey = [p.lat, p.lon, p.altM, p.gs, p.track, p.vr].join();
   if (fixKey !== p.fixKey) {
     p.fixKey = fixKey;
     if (p.curve) p.ghosts.push(p.curve);
-    p.curve = { seen: nowMs, miss: realMin(best.t) ? best.sep : null,
-      pts: samples.map(s => ({ T: nowMs + s.t * 1000, az: s.az, el: s.el })) };
+    p.curve = { seen: nowMs, miss: realMin(pr.tBest) ? pr.sepMin : null,
+      pts: pr.samples.map(s => ({ T: nowMs + s.t * 1000, az: s.az, el: s.el })) };
   }
   p.ghosts = p.ghosts.filter(g => nowMs - g.seen < GHOST_S * 1000);
 }
-// A closest approach still ahead and inside the window. At either end the "minimum"
-// is only where the search stopped: a plane that has passed, or is still coming.
-const realMin = t => t > 0.5 && t < PREDICT_S - 1;
 
 // The numbers behind the fan: where the oldest fix still in it put the miss, if the
 // current fix moves that by at least TREND_R. Straight-line dead reckoning cannot
@@ -350,7 +190,8 @@ function missFrom(p) {
 // ---------- live data ----------
 // Nothing is fetched unless someone is actually watching: the aggregator should cost
 // nothing while this page sits in a background tab or the target is down. The server
-// polls upstream only when asked (see serve.js), so not asking is the whole mechanism.
+// polls upstream only when asked (see serve.js), so not asking is the whole mechanism —
+// unless its always-on mode is switched on, which paces itself (watch.js).
 let hiddenSince = 0;
 document.addEventListener('visibilitychange', () => {
   hiddenSince = document.hidden ? Date.now() : 0;
@@ -398,21 +239,10 @@ async function fetchLive() {
     if (gen !== fetchGen) return;
     const list = data.ac || data.aircraft || [];   // adsb.lol uses "ac", adsb.fi "aircraft"
     const meta = data._meta || {};
+    const nowMs = Date.now();
     for (const ac of list) {
-      if (ac.lat == null || ac.lon == null) continue;
-      if (ac.alt_baro === 'ground') continue;
-      // alt_geom is GNSS height above the ellipsoid; alt_baro is pressure altitude,
-      // roughly above sea level, so it needs the geoid added to share the frame
-      const geom = typeof ac.alt_geom === 'number';
-      if (!geom && typeof ac.alt_baro !== 'number') continue;
-      if (ac.gs == null || ac.track == null) continue;
-      const altM = geom ? ac.alt_geom * FT : ac.alt_baro * FT + cfg.geoidM;
-      if (!cfg.includeLow && altM - cfg.geoidM < 1000) continue;
-      const vr = ((typeof ac.geom_rate === 'number') ? ac.geom_rate
-                : (typeof ac.baro_rate === 'number') ? ac.baro_rate : 0) * FPM;
-      upsertPlane(ac.hex, ac.flight, ac.lat, ac.lon, altM,
-                  ac.gs * KT, ac.track, vr, ac.seen_pos ?? 0, geom ? 'geom' : 'baro',
-                  ac._src || 'public');
+      const f = PTE.aircraftFix(ac, cfg.geoidM, cfg.includeLow);
+      if (f) PTE.upsertPlane(planes, f, nowMs);
     }
     // the server merges a local receiver in per aircraft when one is configured
     const L = meta.local;
@@ -1680,4 +1510,7 @@ renderSoundBtn();
 setInterval(tick, 1000);
 setInterval(countdownLoop, 50);
 setInterval(renderNextCard, 100);
-if (hasLocation()) start(); else openSetup(true);
+loadServerSite().then(() => {
+  applyCfg();   // elevation, geoid and observer from whichever settings won
+  if (hasLocation()) start(); else openSetup(true);
+});
