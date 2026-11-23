@@ -235,8 +235,11 @@ Read-only, no login (another reason to keep the server on your own network):
   crosses it for somebody. For every plane the map draws the line on the ground from
   which it is seen on the centre of the disc during the next 90 s, with an arrow for
   the way that spot runs, +30 s / +60 s marks, and a dotted link back to the plane.
-  Zoomed in, the line becomes a band as wide as the disc: stand anywhere in it and the
-  plane is on the disc. The line through your own dot is the pass the countdown is
+  Round the line is a band as wide as the disc: stand anywhere in it and the plane is
+  on the disc. With the target high it is a hair you have to zoom in to see; with the
+  target low it stretches towards the target and is kilometres wide, and the planes
+  themselves are tens of kilometres away from their lines — which is why each line
+  carries its plane's name. The line through your own dot is the pass the countdown is
   following. Use it to see where you would have had to stand, and to scout: near an
   airport the lines of landing planes fall on top of each other.
   Two limits. The ground is taken to be at your own height, and a plane's reported

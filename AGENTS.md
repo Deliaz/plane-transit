@@ -676,6 +676,10 @@ the body: 17 km for a jet at 10 km with the target 30° up, 57 km at 10°.
   what is drawn. It means the plane's *centre* is on the disc — the same thing
   `klass === 'transit'` means. Close to an airport a plane is larger than the disc
   and touches it from further out; that is not drawn.
+- Enlarged, the spot is labelled with the flight. With the target at 6° a plane 2 km up
+  is 19 km from its line and the band is 2-3 km wide (`along` is `across / sin(el)`,
+  ten times it): the first person to see that took the lines for flight paths and the
+  bands for boxes round them. The name at the line is what says otherwise.
 - In the inset, traffic that is `far` gets the bare line only: with forty planes every
   mark on every one buries the two that matter.
 

@@ -1022,7 +1022,7 @@ function renderMap(frameMs, fresh) {
         return [nx * w, ny * w, w];
       });
       if (half.some(h => h[2] >= 1)) {
-        mctx.fillStyle = col + '38';
+        mctx.fillStyle = col + (far ? '26' : '38');
         mctx.beginPath();
         pts.forEach(([px, py], i) => mctx.lineTo(px + half[i][0], py + half[i][1]));
         for (let i = n - 1; i >= 0; i--) mctx.lineTo(pts[i][0] - half[i][0], pts[i][1] - half[i][1]);
@@ -1052,11 +1052,18 @@ function renderMap(frameMs, fresh) {
         mctx.fillText(`+${T}s`, tx + 5, ty - 4);
       }
       const [sx, sy] = pts[0];
-      mctx.strokeStyle = col + (far ? '40' : '80'); mctx.lineWidth = 1; mctx.setLineDash([2, 4]);
+      mctx.strokeStyle = col + (far ? '80' : 'c0'); mctx.lineWidth = 1; mctx.setLineDash([3, 3]);
       mctx.beginPath(); mctx.moveTo(x, y); mctx.lineTo(sx, sy); mctx.stroke();
       mctx.setLineDash([]);
       mctx.strokeStyle = col; mctx.lineWidth = 1.25;
       mctx.beginPath(); mctx.arc(sx, sy, big ? 3.5 : 2.5, 0, 2 * Math.PI); mctx.stroke();
+      // Whose line it is, said at the line: with the target low its plane is tens of
+      // km off, usually out of the view, and an unnamed line reads as a flight path.
+      if (big && onMap(sx, sy, 40)) {
+        mctx.fillStyle = col; mctx.globalAlpha = far ? 0.75 : 1;
+        mctx.fillText(p.flight, sx + 7, sy + (ey > sy ? -6 : 13));     // on the side the line leaves free
+        mctx.globalAlpha = 1;
+      }
     }
 
     mctx.fillStyle = col;
@@ -1353,6 +1360,7 @@ function renderSkyCtl() {
   const big = mapView.big;
   mapBox.hidden = !mapShown();
   mapBox.classList.toggle('big', big);           // before mapFrame(): it sizes the box
+  mapBox.title = big ? '' : 'Click to enlarge: where on the ground each plane crosses the disc';
   if (big) {
     const f = mapFrame(), mpp = Math.cos(f.lat * D2R) / f.scale;
     $('spanVal').textContent = fmtDist(f.W * mpp);
