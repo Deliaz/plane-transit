@@ -236,7 +236,7 @@ test('between ticks a plane is drawn where the same dead reckoning puts it', () 
     predict(p, now);
     const at0 = posNow(p, now), later = posNow(p, now + 700);
     predict(p, now + 700);                       // what a tick at that moment would have drawn
-    return [at0 === p || (at0.az === p.az), angularSep(later.az, later.el, p.az, p.el), later.range - p.range,
+    return [at0 === p || (at0.az === p.az), Math.max(Math.abs(wrapDeg(later.az - p.az)), Math.abs(later.el - p.el)), later.range - p.range,
       sampleAt(p.pred.samples, 3).t === undefined, sampleAt(p.pred.samples, 1e4)];
   })()`);
   assert.ok(out[0], "at the tick itself it is the tick's position");
