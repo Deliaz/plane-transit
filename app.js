@@ -102,6 +102,7 @@ const BODIES = {
       mapDim: 'rgba(11,14,20,0.35)', mapRing: 'rgba(150,160,180,0.35)',
       mapText: '#aab3c5', observer: '#ffffff',
       unlit: 'rgba(245,233,200,0.13)',   // the moon's dark part: faint, so the disc stays whole
+      silhouette: '#0b0e14',             // a plane against the disc: the page's own dark
     },
   },
   sun: {
@@ -115,7 +116,7 @@ const BODIES = {
       transit: '#ff6448', near: '#ffa33c', far: '#8a7a5e',
       mapFilter: 'invert(1) hue-rotate(180deg) brightness(0.85) sepia(0.6) saturate(0.8)',
       mapDim: 'rgba(21,16,10,0.38)', mapRing: 'rgba(190,168,120,0.32)',
-      mapText: '#bda87e', observer: '#fff3dc',
+      mapText: '#bda87e', observer: '#fff3dc', silhouette: '#17110a',
     },
   },
 };
@@ -156,7 +157,7 @@ const sepAt = (p, age, t) => PTE.sepAt(site(), target, p, age, t);
 function predict(p, nowMs) {
   Object.assign(p, PTE.predictPlane(site(), target, p, nowMs));
   if (!p.trail) { p.trail = []; p.ghosts = []; }
-  p.trail.push({ az: p.az, el: p.el, t: nowMs });
+  p.trail.push({ az: p.az, el: p.el, range: p.range, t: nowMs });
   while (p.trail.length && nowMs - p.trail[0].t > 20000) p.trail.shift();
 
   // Prediction history. Each distinct fix gives its own track, fixed in wall-clock
@@ -208,6 +209,7 @@ function pollPause() {
   return null;
 }
 
+const FEED_NAME = { adsbfi: 'adsb.fi', adsblol: 'adsb.lol' };
 let backoffUntil = 0;
 let fetchGen = 0;              // bumped by restartFetch(); stale responses are dropped
 async function fetchLive() {
@@ -247,9 +249,12 @@ async function fetchLive() {
     // the server merges a local receiver in per aircraft when one is configured
     const L = meta.local;
     const localBit = L && (L.fresher || L.extra) ? ` · local ${L.fresher}↑ ${L.extra}+` : '';
+    // … and asks the other public feed while the chosen one is not answering
+    const F = meta.failover;
+    const viaBit = F ? ` · via ${FEED_NAME[F.to] || F.to} (${FEED_NAME[F.from] || F.from}: ${F.error})` : '';
     srcStatus = meta.publicError
       ? { idle: true, msg: `local receiver only (${list.length} ac) — ${meta.publicError}`, t: Date.now() }
-      : { ok: true, msg: `live ok (${list.length} ac)${localBit}`, t: Date.now() };
+      : { ok: true, msg: `live ok (${list.length} ac)${localBit}${viaBit}`, t: Date.now() };
   } catch (e) {
     srcStatus = { ok: false, msg: `fetch failed: ${e.message}`, t: Date.now() };
   }
@@ -342,14 +347,81 @@ function updateMock() {
 const canvas = document.getElementById('sky');
 const ctx = canvas.getContext('2d');
 
+// The sky as a dome seen from inside: stereographic, centred on the target, zenith
+// up. It is conformal — the disc, the rings and the uncertainty circles stay
+// circles and a direction on screen is the direction in the sky — and at the centre
+// it agrees with the flat frame engine.js reports in (x along azimuth × cos el, y
+// up), so `pred.dir` and `target.limb` need no conversion. Away from the centre the
+// flat chart it replaced went wrong: it spread the zenith over the full width, so a
+// plane passing overhead drew a streak across the whole view.
+// Beyond ~127° from the target the projection runs away, so those points are held
+// on a ring far outside any view, in the right direction.
 function project(az, el, cx, cy, ppd) {
-  return [
-    cx + wrapDeg(az - target.az) * Math.cos(target.el * D2R) * ppd,
-    cy - (el - target.el) * ppd,
-  ];
+  const d = wrapDeg(az - target.az) * D2R, e = el * D2R, e0 = target.el * D2R;
+  const ce = Math.cos(e), se = Math.sin(e), c0 = Math.cos(e0), s0 = Math.sin(e0), cd = Math.cos(d);
+  const X = ce * Math.sin(d), Y = se * c0 - ce * s0 * cd, Z = se * s0 + ce * c0 * cd;
+  const h = Math.hypot(X, Y);
+  if (!h && Z < 0) return [cx, cy + 4 * R2D * ppd];      // dead behind: any direction will do
+  const k = (Z > -0.6 ? 2 / (1 + Z) : 4 / h) * R2D * ppd;
+  return [cx + k * X, cy - k * Y];
 }
 
-function render() {
+// Perspective: how large a plane and its track are drawn for their distance — full
+// size at NEAR_M and closer, then as 1/range, the way things really shrink. This is
+// what says "towards you" or "away": the position on the dome cannot. Not a gentler
+// curve: a jet closing from 27 to 15 km grows 80% along its line, and it has to show.
+// NEAR_M is where a cruising jet passes with the target high; nearer is just "near".
+const NEAR_M = 8000;
+const depth = range => Math.min(1, NEAR_M / range);
+// which way the distance is going right now, from the first two samples (m/s)
+const CLOSING_MS = 15;
+function rangeRate(p) {
+  const s = p.pred.samples;
+  return s.length > 1 ? (s[1].range - s[0].range) / (s[1].t - s[0].t) : 0;
+}
+
+// Where plane p is at the moment being drawn: predict()'s own dead reckoning, asked
+// for `frameMs` instead of the last tick. Not an interpolation between reports — that
+// would draw the plane a report behind — and not a different model: at a tick it is
+// p.az / p.el to the last digit. A tick that is late (a throttled tab) freezes it.
+function posNow(p, frameMs) {
+  const lead = (frameMs - p.pred.at) / 1000;
+  if (!(lead > 0.02 && lead < 5) || !Number.isFinite(p.lat)) return p;
+  const pos = planeAt(p, (frameMs - p.posTime) / 1000);
+  return azElRange(pos.lat, pos.lon, pos.h);
+}
+// a predicted track t seconds after its tick, between its 2 s samples (null past the end)
+function sampleAt(samples, t) {
+  const i = samples.findIndex(s => s.t >= t);
+  if (i < 0) return null;
+  if (i === 0) return samples[0];
+  const a = samples[i - 1], b = samples[i], f = (t - a.t) / (b.t - a.t);
+  return { az: a.az + wrapDeg(b.az - a.az) * f, el: a.el + (b.el - a.el) * f, range: a.range + (b.range - a.range) * f };
+}
+
+// Wingspans in metres by ICAO type, for drawing a plane to scale against the disc.
+// Without a known type the ADS-B size class decides, and without that a single-aisle
+// airliner is assumed: most of what crosses the sky.
+const WINGSPAN_M = {
+  A318: 34.1, A319: 35.8, A320: 35.8, A321: 35.8, A19N: 35.8, A20N: 35.8, A21N: 35.8,
+  A306: 44.8, A310: 43.9, A332: 60.3, A333: 60.3, A338: 64, A339: 64, A342: 60.3, A343: 60.3,
+  A345: 63.5, A346: 63.5, A359: 64.8, A35K: 64.8, A388: 79.8, A400: 42.4, A124: 73.3,
+  B712: 28.4, B733: 28.9, B734: 28.9, B735: 28.9, B736: 34.3, B737: 35.8, B738: 35.8, B739: 35.8,
+  B37M: 35.9, B38M: 35.9, B39M: 35.9, B3XM: 35.9, B744: 64.4, B748: 68.4, B752: 38.1, B753: 38.1,
+  B762: 47.6, B763: 47.6, B764: 51.9, B772: 60.9, B773: 60.9, B77L: 64.8, B77W: 64.8,
+  B788: 60.1, B789: 60.1, B78X: 60.1, MD11: 51.7, MD82: 32.9, MD83: 32.9, C17: 51.8, IL76: 50.5,
+  BCS1: 35.1, BCS3: 35.1, E170: 26, E75L: 28.7, E75S: 28.7, E190: 28.7, E195: 28.7, E290: 33.7, E295: 35.1,
+  CRJ2: 21.2, CRJ7: 23.2, CRJ9: 24.9, CRJX: 26.2, F70: 28.1, F100: 28.1, SU95: 27.8,
+  AT43: 24.6, AT45: 24.6, AT72: 27.1, AT75: 27.1, AT76: 27.1, DH8D: 28.4, SF34: 21.4, SB20: 24.8,
+  GLF5: 28.5, GLF6: 30.4, GLEX: 28.7, F900: 19.3, FA7X: 26.2, C56X: 17, E55P: 15.9, PC24: 17,
+  PC12: 16.3, C208: 15.9, BE20: 16.6, C172: 11, C182: 11, P28A: 9.1, SR22: 11.7, DA40: 11.9,
+};
+const CLASS_SPAN_M = { A1: 11, A2: 18, A3: 36, A4: 38, A5: 61, A6: 12, A7: 12 };
+const wingspanM = p => WINGSPAN_M[p.type] || CLASS_SPAN_M[p.cat] || 36;
+
+// `frameMs` is the moment being drawn. tick() draws its own; between ticks animate()
+// asks for the frames in between, and every plane is put where it is *then* (posNow).
+function render(frameMs = Date.now(), skyOnly = false) {
   const wrap = canvas.parentElement;
   const dpr = window.devicePixelRatio || 1;
   const W = wrap.clientWidth, H = wrap.clientHeight;
@@ -362,29 +434,66 @@ function render() {
   const ppd = Math.min(W, H) / cfg.spanDeg;
   const B = body(), sky = B.sky;
 
-  // grid
+  // grid: the dome's own lines — compass directions meet in the zenith, lines of
+  // equal height curve round it. Each is sampled only where the view can reach.
   const step = cfg.spanDeg <= 20 ? 5 : 10;
+  const c0 = Math.cos(target.el * D2R), s0 = Math.sin(target.el * D2R);
+  // how far the view reaches from its centre (its corners), in degrees of sky
+  const reach = 2 * Math.atan(Math.hypot(W, H) / 2 / ppd * D2R / 2) * R2D;
+  const curve = pts => {
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+  };
+  // where a curve first crosses the line x = at (axis 0) or y = at (axis 1): the
+  // other coordinate there, for hanging a label on the edge of the view
+  const crossing = (pts, axis, at) => {
+    for (let i = 1; i < pts.length; i++) {
+      const u = pts[i - 1], v = pts[i];
+      if (u[axis] !== v[axis] && (u[axis] - at) * (v[axis] - at) <= 0)
+        return u[1 - axis] + (v[1 - axis] - u[1 - axis]) * (at - u[axis]) / (v[axis] - u[axis]);
+    }
+    return null;
+  };
   ctx.strokeStyle = sky.grid; ctx.fillStyle = sky.gridText;
   ctx.lineWidth = 1; ctx.font = '11px system-ui';
-  const azHalf = cfg.spanDeg / (2 * Math.cos(target.el * D2R));
-  for (let a = Math.floor((target.az - azHalf) / step) * step; a <= target.az + azHalf; a += step) {
-    const [x] = project(a, target.el, cx, cy, ppd);
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
-    ctx.fillText(`${((a % 360) + 360) % 360}°`, x + 3, H - 6);
+  const lo = Math.max(-89, target.el - reach);
+  for (let a = 0; a < 360; a += step) {
+    const d = wrapDeg(a - target.az);
+    // the nearest this meridian comes to the centre: abeam of it, or at the zenith
+    const off = Math.abs(d) <= 90 ? Math.asin(c0 * Math.abs(Math.sin(d * D2R))) * R2D : 90 - target.el;
+    const hi = a % 30 ? 80 : 90;       // only every 30° runs on into the zenith
+    if (off > reach || lo >= hi) continue;
+    const pts = [];
+    for (let i = 0; i <= 48; i++) pts.push(project(a, lo + (hi - lo) * i / 48, cx, cy, ppd));
+    curve(pts); ctx.stroke();
+    const x = crossing(pts, 1, H - 6);
+    if (x != null && x > 0 && x < W - 24) ctx.fillText(`${a}°`, x + 3, H - 6);
   }
-  for (let e = Math.floor((target.el - cfg.spanDeg / 2) / step) * step; e <= target.el + cfg.spanDeg / 2; e += step) {
-    const [, y] = project(target.az, e, cx, cy, ppd);
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-    ctx.fillText(`${e}°`, 6, y - 3);
+  const cosReach = Math.cos(reach * D2R);
+  for (let e = Math.ceil(lo / step) * step; e <= Math.min(target.el + reach, 85); e += step) {
+    // the stretch of this parallel within reach of the centre: ±lim in azimuth
+    const q = (cosReach - Math.sin(e * D2R) * s0) / (Math.cos(e * D2R) * c0);
+    if (q >= 1) continue;
+    const lim = q <= -1 ? 180 : Math.acos(q) * R2D;
+    const pts = [];
+    for (let i = 0; i <= 72; i++) pts.push(project(target.az - lim + 2 * lim * i / 72, e, cx, cy, ppd));
+    curve(pts); ctx.stroke();
+    const y = crossing(pts, 0, 6);
+    if (y != null && y > 16 && y < H) ctx.fillText(`${e}°`, 6, y - 3);
   }
 
-  // horizon
-  const [, yHor] = project(target.az, 0, cx, cy, ppd);
-  if (yHor < H + 50) {
-    ctx.fillStyle = sky.ground;
-    ctx.fillRect(0, yHor, W, H - yHor);
-    ctx.strokeStyle = sky.horizon; ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.moveTo(0, yHor); ctx.lineTo(W, yHor); ctx.stroke();
+  // horizon: a circle on the dome, the sky inside it (the ground, once the target
+  // is below). Drawn as a polygon, not an arc: with the target low the circle is
+  // thousands of pixels across, more than some browsers' arcs stay true for.
+  const hor = [];
+  for (let d = -180; d < 180; d++) hor.push(project(target.az + d, 0, cx, cy, ppd));
+  curve(hor); ctx.closePath();
+  if (target.el > 0) ctx.rect(0, 0, W, H);
+  ctx.fillStyle = sky.ground; ctx.fill('evenodd');
+  curve(hor); ctx.closePath();
+  ctx.strokeStyle = sky.horizon; ctx.lineWidth = 1.5; ctx.stroke();
+  const yHor = crossing(hor.slice(90, 271), 0, W - 55);   // the near half, left to right
+  if (yHor != null && yHor > 16 && yHor < H + 5) {
     ctx.fillStyle = sky.horizonText; ctx.fillText('horizon', W - 55, yHor - 5);
   }
 
@@ -399,23 +508,40 @@ function render() {
   ctx.strokeStyle = B.disc + '66';
   ctx.beginPath(); ctx.arc(cx, cy, 3 * target.angR * ppd, 0, 2 * Math.PI); ctx.stroke();
 
+  // With a wide search radius most planes are nowhere near the view, and a frame is
+  // drawn 30 times a second: leave out those whose trail and track stay outside it.
+  // Four points stand for the lot — a track is close enough to straight that it
+  // cannot cross the view while the box round its ends and middle misses it.
+  const shown = new Set();
+  for (const p of planes.values()) {
+    if (!p.pred) continue;
+    const sm = p.pred.samples;
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const s of [p.trail[0] || p, p, sm[sm.length >> 1], sm[sm.length - 1]]) {
+      const [x, y] = project(s.az, s.el, cx, cy, ppd);
+      x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y);
+    }
+    if (x1 > -100 && x0 < W + 100 && y1 > -100 && y0 < H + 100) shown.add(p);
+  }
+
   // planes: paths first, then the target disc over them, then dots + labels on top
   const colors = sky;   // keyed by klass: transit / near / far
   // with "show near misses" off, near passes are drawn as ordinary far traffic
   const kOf = p => (p.klass === 'near' && !cfg.showNear) ? 'far' : p.klass;
   ctx.font = '12px system-ui';
-  for (const p of planes.values()) {
-    if (!p.pred) continue;
+  for (const p of shown) {
     const k = kOf(p);
     const col = colors[k];
-    // trail
-    ctx.strokeStyle = col + '55'; ctx.lineWidth = 1;
-    ctx.beginPath();
-    p.trail.forEach((s, i) => {
-      const [x, y] = project(s.az, s.el, cx, cy, ppd);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
-    ctx.stroke();
+    // Where it has been and where it is going, as one band in perspective (see
+    // drawBand): the trail fainter, the prediction under its line.
+    const far = k === 'far', wide = far ? 3.5 : 5;
+    // both start at the plane as it is this frame, not at the last tick's position
+    const cur = posNow(p, frameMs), lead = Math.max(0, (frameMs - p.pred.at) / 1000);
+    const ahead = [cur].concat(p.pred.samples.filter(s => s.t > lead + 0.05));
+    const behind = p.trail.concat(cur);
+    const path = ahead.map(s => project(s.az, s.el, cx, cy, ppd));
+    drawBand(behind.map(s => project(s.az, s.el, cx, cy, ppd)), behind.map(s => s.range), wide, col, far ? 0.25 : 0.35);
+    drawBand(path, ahead.map(s => s.range), wide, col, far ? 0.5 : 0.7);
     // earlier fixes' predictions, from now onward, fading with the age of the fix.
     // Drawn under the current line, so they only show where they disagree with it.
     const nowMs = p.pred.at;
@@ -432,19 +558,16 @@ function render() {
       ctx.stroke();
     }
     // predicted path with ETA ticks and arrowheads
-    ctx.strokeStyle = col; ctx.lineWidth = k === 'far' ? 1 : 1.8;
-    const path = p.pred.samples.map(s => project(s.az, s.el, cx, cy, ppd));
-    ctx.beginPath();
-    path.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
-    ctx.stroke();
+    ctx.strokeStyle = col; ctx.lineWidth = far ? 1 : 1.5;
+    curve(path); ctx.stroke();
     ctx.fillStyle = col;
-    drawHeads(path, p.pred.samples, W, H);
-    for (const s of p.pred.samples) {
-      if (s.t === 30 || s.t === 60) {
-        const [x, y] = project(s.az, s.el, cx, cy, ppd);
-        ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
-        ctx.fillText(`+${s.t}s`, x + 4, y - 4);
-      }
+    drawHeads(path, ahead, W, H);
+    for (const t of [30, 60]) {            // 30 and 60 s from this frame, not from the tick
+      const s = sampleAt(p.pred.samples, t + lead);
+      if (!s) continue;
+      const [x, y] = project(s.az, s.el, cx, cy, ppd);
+      ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+      ctx.fillText(`+${t}s`, x + 4, y - 4);
     }
     // uncertainty circle + miss-distance label at closest approach
     if (k !== 'far') {
@@ -473,22 +596,113 @@ function render() {
     ctx.beginPath(); ctx.arc(cx, cy, rDisc, 0, 2 * Math.PI); ctx.fill();
   } else drawPhase(cx, cy, rDisc, target.illum, target.limb, B.disc, sky.unlit);
 
+  // What the shot will look like: at closest approach, the plane to scale against the
+  // disc — its real wingspan at the range it will have there, turned and tipped as
+  // you will see it. Dark on the disc, as a silhouette is; outlined in its colour
+  // when it misses, or it would be dark on dark.
+  // Only once the zoom makes it more than a speck.
   for (const p of planes.values()) {
-    if (!p.pred) continue;
-    const [x, y] = project(p.az, p.el, cx, cy, ppd);
-    ctx.fillStyle = colors[kOf(p)];
-    ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 2 * Math.PI); ctx.fill();
-    ctx.fillText(`${p.flight} ${(p.altM / 1000).toFixed(1)}km`, x + 6, y + 12);
+    if (!p.pred || kOf(p) === 'far' || !realMin(p.pred.tBest) || !(p.pred.elMin > 0)) continue;
+    const half = wingspanM(p) / 2 / p.pred.rangeMin * R2D * ppd;
+    if (half < 3) continue;
+    const [x, y] = project(p.pred.azMin, p.pred.elMin, cx, cy, ppd);
+    ctx.fillStyle = sky.silhouette;
+    ctx.strokeStyle = p.pred.sepMin <= target.angR ? sky.silhouette : colors[kOf(p)];
+    drawPlane(p.pred.azMin, p.pred.elMin, p.track, x, y, cx, cy, ppd, half, 0);
   }
 
-  if (cfg.showMap) renderMap(colors, kOf);
+  for (const p of shown) {
+    const cur = posNow(p, frameMs);
+    const [x, y] = project(cur.az, cur.el, cx, cy, ppd);
+    if (x < -80 || y < -80 || x > W + 80 || y > H + 80) continue;
+    const half = Math.max(4.5, 26 * depth(cur.range));   // half the wingspan, px
+    ctx.fillStyle = ctx.strokeStyle = colors[kOf(p)];
+    drawPlane(cur.az, cur.el, p.track, x, y, cx, cy, ppd, half, MIN_TILT);
+    // the same thing in words: how far, and which way that is going
+    const rr = rangeRate(p), lx = x + 8, ly = y + Math.max(13, half * 0.7 + 9);
+    ctx.font = '12px system-ui';
+    ctx.fillText(`${p.flight} ${(p.altM / 1000).toFixed(1)}km up`, lx, ly);
+    ctx.font = '11px system-ui'; ctx.globalAlpha = 0.8;
+    ctx.fillText(`${(cur.range / 1000).toFixed(0)} km · `
+      + (rr < -CLOSING_MS ? 'coming closer' : rr > CLOSING_MS ? 'going away' : 'at its closest'), lx, ly + 13);
+    ctx.globalAlpha = 1;
+  }
+
+  if (cfg.showMap && !skyOnly) renderMap(colors, kOf);   // tiles and a filter: once a tick is plenty
+}
+
+// A track as a band in perspective: as wide as the plane is near (depth()), and
+// fading into the distance. A band that swells ahead of the plane is one coming
+// towards you, one that thins to a hair is going away, an even one is crossing
+// sideways — read like a road, with no need to find the plane itself.
+// `wide` is the half-width in px at NEAR_M; `strength` the opacity there.
+function drawBand(path, ranges, wide, col, strength) {
+  const n = path.length;
+  if (n < 2) return;
+  const edge = path.map((pt, i) => {
+    const u = path[Math.max(0, i - 1)], v = path[Math.min(n - 1, i + 1)];
+    const dx = v[0] - u[0], dy = v[1] - u[1], len = Math.hypot(dx, dy) || 1;
+    const h = Math.max(0.6, wide * depth(ranges[i]));
+    return [-dy / len * h, dx / len * h];
+  });
+  const shade = i => col
+    + Math.round(255 * strength * (0.25 + 0.75 * depth(ranges[i]))).toString(16).padStart(2, '0');
+  const [x0, y0] = path[0], [x1, y1] = path[n - 1];
+  const chord = (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0);
+  if (chord < 4) ctx.fillStyle = shade(0);     // heading straight at you: no line to shade along
+  else {
+    const g = ctx.createLinearGradient(x0, y0, x1, y1);
+    for (let i = 0; ; i = Math.min(n - 1, i + 4)) {
+      const f = ((path[i][0] - x0) * (x1 - x0) + (path[i][1] - y0) * (y1 - y0)) / chord;
+      g.addColorStop(Math.min(1, Math.max(0, f)), shade(i));
+      if (i === n - 1) break;
+    }
+    ctx.fillStyle = g;
+  }
+  ctx.beginPath();
+  path.forEach(([x, y], i) => i ? ctx.lineTo(x + edge[i][0], y + edge[i][1]) : ctx.moveTo(x + edge[i][0], y + edge[i][1]));
+  for (let i = n - 1; i >= 0; i--) ctx.lineTo(path[i][0] - edge[i][0], path[i][1] - edge[i][1]);
+  ctx.closePath(); ctx.fill();
+}
+
+// The plane itself, as it looks from where you stand: a small model turned to its
+// track, flying level, seen from below along the line of sight — one overhead shows
+// its plan, one lower down is tipped away, nose up the screen when it comes towards
+// you and down to the horizon when it leaves. The marker for where a plane is now is
+// never tipped flatter than MIN_TILT: seen truly edge on, a plane low in the sky is a
+// dash that says nothing, and its `half` (half the wingspan, px) comes from depth():
+// bigger is nearer, not to scale. The silhouette at closest approach is the honest
+// one: real tilt, real size (wingspanM).
+// The model is [forward, right] and, for the fin, [forward, up]; half a wingspan = 1.
+const MIN_TILT = 35;
+const PLANE_BODY = [[1.05, 0], [0.85, 0.09], [0.3, 0.1], [-0.25, 1], [-0.42, 1], [-0.15, 0.1],
+  [-0.75, 0.08], [-1, 0.38], [-1.1, 0.38], [-1.02, 0]];
+const PLANE_FIN = [[-0.6, 0], [-1, 0.4], [-1.12, 0.4], [-1.02, 0]];
+function drawPlane(az, el, track, x, y, cx, cy, ppd, half, minTilt) {
+  // "up" on screen at the plane (the dome's meridians lean away from the centre one)
+  const [ux, uy] = project(az, el + 0.05, cx, cy, ppd);
+  const n = Math.hypot(ux - x, uy - y) || 1, ex = (ux - x) / n, ey = (uy - y) / n;
+  // the model's axes as a camera pitched up at the plane sees them: [right, up]
+  const b = (track - az) * D2R, tilt = Math.max(el, minTilt) * D2R;
+  const st = Math.sin(tilt), ct = Math.cos(tilt);
+  const fwd = [Math.sin(b), -st * Math.cos(b)], right = [Math.cos(b), st * Math.sin(b)], up = [0, ct];
+  const shape = (pts, side) => {
+    ctx.beginPath();
+    pts.forEach(([f, s], i) => {
+      const r = (f * fwd[0] + s * side[0]) * half, u = (f * fwd[1] + s * side[1]) * half;
+      const X = x - r * ey + u * ex, Y = y + r * ex + u * ey;   // screen right = "up" turned a quarter
+      i ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y);
+    });
+    ctx.closePath(); ctx.fill(); ctx.stroke();   // the stroke keeps a thin wing visible
+  };
+  ctx.lineWidth = 1; ctx.lineJoin = 'round';
+  shape(PLANE_BODY.concat(PLANE_BODY.slice(1, -1).reverse().map(([f, s]) => [f, -s])), right);
+  shape(PLANE_FIN, up);
 }
 
 // Arrowheads along a predicted path, HEAD_GAP px apart on screen whatever the zoom, so
-// any stretch of line in view says which way the plane flies — the dot is often off
-// screen. Sized in perspective (1/range, clamped): a plane crossing sideways keeps
-// even heads, one coming towards you grows them along its line. That is the depth
-// the sky view has no other way to show; where it appears is all flat.
+// any stretch of line in view says which way the plane flies — the plane is often
+// off screen. Sized in perspective like the band they sit on (1/range, clamped).
 const HEAD_GAP = 90;
 function drawHeads(path, samples, W, H) {
   let next = HEAD_GAP / 2;
@@ -499,7 +713,7 @@ function drawHeads(path, samples, W, H) {
       const f = next / len, x = x0 + (x1 - x0) * f, y = y0 + (y1 - y0) * f;
       if (x < -10 || y < -10 || x > W + 10 || y > H + 10) continue;
       const range = samples[i - 1].range + (samples[i].range - samples[i - 1].range) * f;
-      const s = Math.min(8, Math.max(3.5, 120000 / range));
+      const s = Math.max(3.5, 10 * depth(range));
       ctx.save();
       ctx.translate(x, y); ctx.rotate(Math.atan2(y1 - y0, x1 - x0));
       ctx.beginPath(); ctx.moveTo(s, 0); ctx.lineTo(-s * 0.8, s * 0.75); ctx.lineTo(-s * 0.8, -s * 0.75);
@@ -588,7 +802,7 @@ function renderMap(colors, kOf) {
   mctx.fillRect(0, 0, S, S);
 
   // range rings
-  const ringKm = Rm > 60000 ? 25 : 10;
+  const ringKm = Rm > 130000 ? 50 : Rm > 60000 ? 25 : 10;
   mctx.strokeStyle = sky.mapRing; mctx.fillStyle = sky.mapText;
   mctx.font = '9px system-ui'; mctx.lineWidth = 1;
   for (let r = ringKm * 1000; r <= Rm; r += ringKm * 1000) {
@@ -664,7 +878,7 @@ function renderTables() {
   pb.innerHTML = passes.map(p => `<tr class="${p.klass}">
     <td>${p.flight}${alerted.has(p.hex) ? ' ♪' : ''}</td><td>${dirArrow(p.pred.dir)}</td><td>${p.pred.tMin}s</td>
     <td>${fmtMiss(p)}</td><td>${fmtSep(p.pred.delta)}</td>
-    <td>${p.trust}${p.maneuvering ? ' ⚠' : ''}</td></tr>`).join('');
+    <td>${p.trust}${p.maneuvering ? ' ⚠' : p.turn ? ' ↻' : ''}</td></tr>`).join('');
   $('passEmpty').style.display = passes.length ? 'none' : '';
 
   const all = list.sort((a, b) => a.sepNow - b.sepNow).slice(0, 25);
@@ -730,7 +944,7 @@ function renderNextCard() {
   $('ncEta').textContent = onDisc ? 'NOW' : s > 0 ? `in ${s < 10 ? s.toFixed(1) : Math.round(s)} s` : 'passed';
   $('ncDir').style.transform = `rotate(${pr.dir.toFixed(0)}deg)`;
   $('ncSub').textContent = `miss ${fmtMiss(p)} ± `
-    + `${(pr.delta / target.angR).toFixed(1)} · trust ${p.trust}${p.maneuvering ? ' ⚠ turning' : ''}`
+    + `${(pr.delta / target.angR).toFixed(1)} · trust ${p.trust}${p.maneuvering ? ' ⚠ turning' : p.turn ? ' ↻ turning' : ''}`
     + ` · ${(p.range / 1000).toFixed(0)} km away, ${(p.altM / 1000).toFixed(1)} km up`;
 }
 
@@ -1415,6 +1629,19 @@ function markSeen() {
   savePassLog();
   return true;
 }
+// What the marked passes say together: the typical real − predicted, and how far the
+// marks scatter around it (median and median deviation: one fumbled press must not
+// move either). A steady offset larger than the scatter is a timing bias — a delayed
+// feed makes planes arrive early, i.e. negative. It is reported, never applied: three
+// presses with a finger's reaction time in them are evidence, not a calibration.
+function passLogOffset(rows) {
+  const d = rows.filter(r => r.seen != null).map(r => (r.seen - r.mid) / 1000).sort((a, b) => a - b);
+  if (d.length < 3) return null;
+  const mid = a => (a.length % 2 ? a[(a.length - 1) / 2] : (a[a.length / 2 - 1] + a[a.length / 2]) / 2);
+  const median = mid(d), spread = mid(d.map(x => Math.abs(x - median)).sort((a, b) => a - b));
+  return { n: d.length, median, spread, steady: Math.abs(median) > Math.max(0.3, spread) };
+}
+
 function renderPassLog() {
   const t = ms => new Date(ms).toLocaleTimeString([], { hour12: false }) + '.' + Math.floor(ms % 1000 / 100);
   const arrow = (up, side) => `${up >= 0 ? '↑' : '↓'}${Math.abs(up).toFixed(2)} ${side >= 0 ? '→' : '←'}${Math.abs(side).toFixed(2)}`;
@@ -1423,6 +1650,15 @@ function renderPassLog() {
     <td>${r.missR}R ${r.rangeKm}km</td>
     <td>${r.seen == null ? '—' : ((r.seen - r.mid) / 1000 > 0 ? '+' : '') + ((r.seen - r.mid) / 1000).toFixed(1) + 's'}</td></tr>`).join('');
   $('passLogEmpty').style.display = passLog.length ? 'none' : '';
+  const o = passLogOffset(passLog), note = $('passLogOffset');
+  note.hidden = !o;
+  if (o) {
+    note.textContent = `${o.n} marked passes: typically ${o.median > 0 ? '+' : ''}${o.median.toFixed(1)} s, `
+      + `most within ±${o.spread.toFixed(1)} s — `
+      + (!o.steady ? 'no steady offset'
+        : o.median < 0 ? 'planes come earlier than predicted, the way a delayed feed makes them'
+          : 'planes come later than predicted');
+  }
 }
 // Space belongs to the log everywhere except text entry. A focused checkbox or
 // button (the sound toggle, Test sound — whatever was clicked last) would otherwise
@@ -1508,6 +1744,19 @@ loadCfgUI();
 renderSkyCtl();
 renderSoundBtn();
 setInterval(tick, 1000);
+// Between ticks only the drawing moves: the same prediction, shown for each frame's
+// own moment, ~30 times a second. Nothing is computed that a tick does not compute,
+// so with reduced motion asked for (or no frames, in a hidden tab) the view is just
+// the once-a-second one again.
+const calmMotion = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+let lastFrame = 0;
+function animate(ts) {
+  requestAnimationFrame(animate);
+  if (!started || !target || !planes.size || (calmMotion && calmMotion.matches) || ts - lastFrame < 30) return;
+  lastFrame = ts;
+  render(Date.now(), true);
+}
+if (window.requestAnimationFrame) requestAnimationFrame(animate);
 setInterval(countdownLoop, 50);
 setInterval(renderNextCard, 100);
 loadServerSite().then(() => {

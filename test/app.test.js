@@ -186,3 +186,60 @@ test('every heads-up ends in a tone or a call-off, a turn included', () => {
   assert.strictEqual(heard('P.pred.tBest = 0'), '', 'passed on the disc: no call-off');
   run('planes.clear(); resetCountdown(); alerted.clear(); delete window.AudioContext; audioCtx = null');
 });
+
+test('the sky view is a dome: flat at its centre, whole overhead, bounded behind', () => {
+  run(`target = { az: 120, el: 30, angR: 0.26 }`);
+  const P = (az, el) => run(`project(${az}, ${el}, 500, 400, 20)`);
+  near(P(120, 30), [500, 400], 1e-9, 'the target is the centre');
+  // near the centre it is the flat frame engine.js reports in: x along az × cos el, y up
+  near(P(120.2, 30.1), [500 + 0.2 * Math.cos(30 * Math.PI / 180) * 20, 400 - 0.1 * 20], 0.02, 'flat frame');
+  // every azimuth meets in one point overhead, straight above the centre
+  const zenith = P(0, 90);
+  near(P(250, 90), [...zenith], 1e-6, 'one zenith');
+  near(zenith, [500, 400 - 2 * Math.tan(30 * Math.PI / 180) * (180 / Math.PI) * 20], 1e-6, 'zenith above');
+  // the far side of the sky lands well outside any view, never back in the middle
+  for (const [az, el] of [[300, -30], [300.5, -29.5], [280, 5], [320, 20]]) {
+    const [x, y] = P(az, el);
+    assert.ok(Number.isFinite(x) && Number.isFinite(y), `finite at ${az}/${el}`);
+    assert.ok(Math.hypot(x - 500, y - 400) > 2000, `far out at ${az}/${el}`);
+  }
+});
+
+test('planes are drawn in true perspective, and say which way the distance goes', () => {
+  assert.strictEqual(run(`depth(4000)`), 1);
+  assert.strictEqual(run(`depth(NEAR_M)`), 1);
+  assert.ok(Math.abs(run(`depth(2 * NEAR_M)`) - 0.5) < 1e-12);
+  const rate = (r0, r1) => run(`rangeRate({ pred: { samples: [{ t: 0, range: ${r0} }, { t: 2, range: ${r1} }] } })`);
+  assert.strictEqual(rate(20000, 19600), -200);
+  assert.strictEqual(rate(20000, 20300), 150);
+  assert.strictEqual(run(`rangeRate({ pred: { samples: [{ t: 0, range: 1 }] } })`), 0);
+});
+
+test('the pass log sums up its marks: a steady offset, or none', () => {
+  const off = secs => run(`passLogOffset(${JSON.stringify(secs.map(s => ({ mid: 1e6, seen: s == null ? null : 1e6 + s * 1000 })))})`);
+  assert.strictEqual(off([-1.2, null, -0.9]), null, 'two marks say nothing yet');
+  let o = off([-1.4, -1.1, null, -0.9, -1.2, 6]);          // one fumbled press among five
+  assert.strictEqual(o.n, 5);
+  assert.ok(Math.abs(o.median + 1.1) < 1e-9 && o.spread < 0.35 && o.steady, 'early by about a second');
+  o = off([-2, 1.5, 0.2, -0.4, 2.2]);
+  assert.ok(!o.steady, 'scattered marks are not an offset');
+});
+
+test('between ticks a plane is drawn where the same dead reckoning puts it', () => {
+  placeObserver(run, 52.37, 4.89, 2);
+  const out = run(`(() => {
+    const now = Date.now();
+    updateTarget(new Date(now));
+    planes.clear();
+    upsertPlane('anim', 'ANIM', 52.50, 4.60, 10000, 230, 110, 0, 1.2, 'geom', 'test');
+    const p = planes.get('anim');
+    predict(p, now);
+    const at0 = posNow(p, now), later = posNow(p, now + 700);
+    predict(p, now + 700);                       // what a tick at that moment would have drawn
+    return [at0 === p || (at0.az === p.az), angularSep(later.az, later.el, p.az, p.el), later.range - p.range,
+      sampleAt(p.pred.samples, 3).t === undefined, sampleAt(p.pred.samples, 1e4)];
+  })()`);
+  assert.ok(out[0], "at the tick itself it is the tick's position");
+  assert.ok(out[1] < 1e-9 && Math.abs(out[2]) < 1e-6, `same place as a tick would draw: ${out[1]} deg, ${out[2]} m`);
+  assert.strictEqual(out[4], null, 'no sample past the end of the track');
+});

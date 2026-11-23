@@ -201,6 +201,51 @@ function mergeFeeds(pub, loc) {
 
 const planesKey = (src, la, lo, r) => `${src}|${la}|${lo}|${r}`;
 
+// One request to a public feed, through the one budget and the back-off.
+function askUpstream(src, la, lo, r, timeoutMs) {
+  const why = upstreamRefusal();
+  if (why) {
+    stats.upstreamLimited++;
+    return Promise.reject(Object.assign(new Error(why), { status: 429 }));
+  }
+  stats.upstreamReqs++;
+  return getJSON(UPSTREAM[src](la, lo, r), timeoutMs).then(
+    d => { upstreamResult(null); return d; },
+    e => { upstreamResult(e); throw e; });
+}
+
+// The two public feeds cover for each other. One that is down — a timeout, a 5xx, a
+// broken answer — is passed over for FAILOVER_MS and the other asked instead, so an
+// outage costs one late poll, not the session. Then it gets one try per FAILOVER_MS
+// with a short wait (both requests must fit inside the browser's 5 s), until it
+// answers again. A refusal (4xx) is never a reason to go elsewhere: that is the
+// back-off's business, and it stops every upstream request. The answer says who gave
+// it (`_via`), because the cache hands it to callers that never saw the failure.
+const OTHER = { adsbfi: 'adsblol', adsblol: 'adsbfi' };
+const FAILOVER_MS = 60000;
+const feedDown = {};           // src -> { until, error }
+function publicFeed(src, la, lo, r) {
+  const alt = OTHER[src], down = feedDown[src];
+  const viaAlt = cause => askUpstream(alt, la, lo, r, 2500).then(
+    d => Object.assign(d, { _via: { from: src, to: alt, error: cause } }),
+    e => {
+      feedDown[src].until = 0;     // neither answers: the next poll starts with the chosen one again
+      throw Object.assign(new Error(`${cause}; ${alt}: ${e.message}`), { status: e.status });
+    });
+  if (down && Date.now() < down.until) return viaAlt(down.error);
+  return askUpstream(src, la, lo, r, down ? 2000 : 5000).then(
+    d => {
+      if (down) { delete feedDown[src]; log(`${src} is answering again`); }
+      return d;
+    },
+    e => {
+      if (!alt || (e.status >= 400 && e.status < 500)) throw e;
+      if (!down) log(`${src} is not answering (${e.message}): asking ${alt} meanwhile`);
+      feedDown[src] = { until: Date.now() + FAILOVER_MS, error: e.message };
+      return viaAlt(e.message);
+    });
+}
+
 // One area's aircraft, public feed and local receiver merged, every seen_pos aged to
 // this moment. `since` makes it a peek: only a public snapshot newer than that, already
 // fetched by someone else, and null otherwise — the watcher reading along with a
@@ -217,17 +262,7 @@ async function snapshot({ src, lat, lon, r }, since = null, useLocal = !!LOCAL_U
     if (!e || !e.data || e.at <= since) return null;
     pubP = Promise.resolve(e);
   } else {
-    pubP = cached(key, CACHE_MS, () => {
-      const why = upstreamRefusal();
-      if (why) {
-        stats.upstreamLimited++;
-        return Promise.reject(Object.assign(new Error(why), { status: 429 }));
-      }
-      stats.upstreamReqs++;
-      return getJSON(UPSTREAM[src](la, lo, r), 5000).then(
-        d => { upstreamResult(null); return d; },
-        e => { upstreamResult(e); throw e; });
-    }).catch(e => {
+    pubP = cached(key, CACHE_MS, () => publicFeed(src, la, lo, r)).catch(e => {
       stats.upstreamErrors++; stats.lastError = `${src}: ${e.message}`;
       meta.publicError = e.message; meta.publicStatus = e.status || null;
       return null;
@@ -246,6 +281,7 @@ async function snapshot({ src, lat, lon, r }, since = null, useLocal = !!LOCAL_U
   // seen_pos was measured before that. Hand on the true age: the browser dead-reckons
   // from it, so an unaged fix quietly moves the plane by speed × cache age.
   const pub = pubEntry && pubEntry.data;
+  if (pub && pub._via) meta.failover = pub._via;
   const cacheAgeS = pubEntry ? (Date.now() - pubEntry.at) / 1000 : 0;
   const pubList = (pub ? (pub.aircraft || pub.ac || []) : [])
     .map(a => (cacheAgeS > 0.05 ? Object.assign({}, a, { seen_pos: ageOf(a) + cacheAgeS }) : a));
@@ -483,4 +519,5 @@ function main() {
 
 if (require.main === module) main();
 module.exports = { handle, usable, mergeFeeds, upstreamAllowed, upstreamRefusal, upstreamResult, stats,
+  snapshot, UPSTREAM, feedDown, FAILOVER_MS, upstreamTimes,
   getJSON, loadSettings, watcher, UPSTREAM_MAX, UPSTREAM_WINDOW_MS, UPSTREAM_DAILY_MAX, SNAP_MAX };

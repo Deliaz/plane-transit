@@ -23,6 +23,18 @@
   const FT = 0.3048, KT = 0.514444, FPM = 0.00508;
   const D2R = Math.PI / 180, R2D = 180 / Math.PI;
   const WGS_A = 6378137, WGS_E2 = 6.69437999014e-3;
+  // Following a turn (turnRate, planeAt). A turn is believed only when the last few
+  // reports all swing the same way, by more than track noise can; it is then flown on
+  // for `holdS` seconds past the report and straight after that, because nothing says
+  // how long it lasts. holdS = 0 switches the whole thing off: straight lines only.
+  const TURN = {
+    windowS: 12,    // reports this recent are compared
+    minSpanS: 4,    // … and must cover at least this long
+    minRate: 0.3,   // deg/s: under this it is flown as straight
+    minDeg: 2,      // total swing over the window; ADS-B track wanders a few tenths
+    maxRate: 4,     // deg/s cap (a standard-rate turn is 3)
+    holdS: 12,
+  };
 
   // The geometry of each target. The two angular radii land within 2% of each other
   // (~0.26 deg), which is why one set of thresholds serves both.
@@ -158,15 +170,37 @@
               : (typeof ac.baro_rate === 'number') ? ac.baro_rate : 0) * FPM;
     return {
       hex: ac.hex, flight: ac.flight, type: typeof ac.t === 'string' ? ac.t : null,
+      cat: typeof ac.category === 'string' ? ac.category : null,   // size class, A1 light … A5 heavy
       lat: ac.lat, lon: ac.lon, altM, gs: ac.gs * KT, track: ac.track, vr,
       ageS: ac.seen_pos == null ? 0 : ac.seen_pos, altSrc: geom ? 'geom' : 'baro',
       feed: ac._src || 'public',
     };
   }
 
+  // Degrees per second the plane is turning (+ = clockwise), or 0 when the reports do
+  // not agree on one: fewer than three, a step the other way, a step that hardly
+  // turned (the turn is over), or a swing small enough to be noise. 0 is the common
+  // case by far, and with 0 planeAt is the straight line it always was.
+  function turnRate(fixes) {
+    const n = fixes.length;
+    if (!(TURN.holdS > 0) || n < 3) return 0;
+    const span = (fixes[n - 1].t - fixes[0].t) / 1000;
+    if (span < TURN.minSpanS) return 0;
+    let total = 0, sign = 0;
+    for (let i = 1; i < n; i++) {
+      const d = wrapDeg(fixes[i].track - fixes[i - 1].track);
+      const dt = (fixes[i].t - fixes[i - 1].t) / 1000;
+      if (Math.abs(d) < TURN.minRate * dt / 2 || (sign && Math.sign(d) !== sign)) return 0;
+      sign = Math.sign(d); total += d;
+    }
+    const rate = total / span;
+    if (Math.abs(rate) < TURN.minRate || Math.abs(total) < TURN.minDeg) return 0;
+    return Math.max(-TURN.maxRate, Math.min(TURN.maxRate, rate));
+  }
+
   function upsertPlane(planes, f, nowMs) {
     let p = planes.get(f.hex);
-    if (!p) { p = { hex: f.hex, hist: [] }; planes.set(f.hex, p); }
+    if (!p) { p = { hex: f.hex, hist: [], fixes: [] }; planes.set(f.hex, p); }
     // maneuver detection from recent track / vertical-rate changes
     const last = p.hist[p.hist.length - 1];
     if (!last || last.track !== f.track || last.vr !== f.vr) {
@@ -184,12 +218,20 @@
     // fix look newer than it is, so the earliest estimate of a given fix is the best.
     const posTime = nowMs - f.ageS * 1000;
     const sameFix = p.lat === f.lat && p.lon === f.lon && p.altM === f.altM;
+    // the track at each distinct report, by the report's own time, for turnRate().
+    // A report older than the last one (two feeds merged) says nothing about a turn.
+    const fixes = p.fixes || (p.fixes = []);
+    const lastFix = fixes[fixes.length - 1];
+    if (!sameFix && (!lastFix || posTime - lastFix.t > 200)) {
+      fixes.push({ t: posTime, track: f.track });
+      while (fixes.length > 5 || posTime - fixes[0].t > TURN.windowS * 1000) fixes.shift();
+    }
     Object.assign(p, {
-      flight: (f.flight || f.hex).trim(), type: f.type || p.type || null,
+      flight: (f.flight || f.hex).trim(), type: f.type || p.type || null, cat: f.cat || p.cat || null,
       lat: f.lat, lon: f.lon, altM: f.altM, altSrc: f.altSrc, feed: f.feed,
       gs: f.gs, track: f.track, vr: f.vr,
       posTime: sameFix ? Math.min(p.posTime, posTime) : posTime,
-      lastSeen: nowMs, maneuvering,
+      lastSeen: nowMs, maneuvering, turn: turnRate(fixes),
     });
     return p;
   }
@@ -199,12 +241,25 @@
       if (nowMs - p.lastSeen > STALE_MS) planes.delete(hex);
   }
 
-  // dead-reckoned geodetic position of plane p at dtS seconds after its fix
+  // dead-reckoned geodetic position of plane p at dtS seconds after its fix: straight
+  // on, or — for a plane caught turning (p.turn) — round the arc for TURN.holdS
+  // seconds and straight on from the heading it has reached by then
   function planeAt(p, dtS) {
-    const vN = p.gs * Math.cos(p.track * D2R), vE = p.gs * Math.sin(p.track * D2R);
-    const lat = p.lat + vN * dtS / 111320;
-    const lon = p.lon + vE * dtS / (111320 * Math.cos(p.lat * D2R));
-    return { lat, lon, h: p.altM + p.vr * dtS };
+    if (!p.turn) {
+      const vN = p.gs * Math.cos(p.track * D2R), vE = p.gs * Math.sin(p.track * D2R);
+      const lat = p.lat + vN * dtS / 111320;
+      const lon = p.lon + vE * dtS / (111320 * Math.cos(p.lat * D2R));
+      return { lat, lon, h: p.altM + p.vr * dtS };
+    }
+    const w = p.turn * D2R, h0 = p.track * D2R;
+    const onArc = Math.min(dtS, TURN.holdS), h1 = h0 + w * onArc, after = dtS - onArc;
+    const dN = p.gs * ((Math.sin(h1) - Math.sin(h0)) / w + Math.cos(h1) * after);
+    const dE = p.gs * ((Math.cos(h0) - Math.cos(h1)) / w + Math.sin(h1) * after);
+    return {
+      lat: p.lat + dN / 111320,
+      lon: p.lon + dE / (111320 * Math.cos(p.lat * D2R)),
+      h: p.altM + p.vr * dtS,
+    };
   }
 
   // ---------- prediction ----------
@@ -290,7 +345,7 @@
   }
 
   return {
-    PREDICT_S, STALE_MS, KM_PER_AU, FT, KT, FPM, D2R, R2D, WGS_A, WGS_E2, BODIES,
+    PREDICT_S, STALE_MS, KM_PER_AU, FT, KT, FPM, D2R, R2D, WGS_A, WGS_E2, BODIES, TURN, turnRate,
     geodeticToECEF, makeSite, refrShare, azElRange, pointAt, wrapDeg, angularSep,
     bodyAzEl, bodyTarget, limbAngle, targetAt,
     aircraftFix, upsertPlane, dropStalePlanes, planeAt, sepAt, realMin, predictPlane,

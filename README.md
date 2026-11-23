@@ -187,18 +187,36 @@ Read-only, no login (another reason to keep the server on your own network):
   (dark sepia, sand, old-paper cream, faded-ink vermillion, sepia-toned map tiles).
   Both stay dark — sun mode is the same night-UI shape, just lit warm.
 - **Source**: `adsb.fi` (default) or `adsb.lol` — free, no key, polled every 3 s.
+  If the one you chose stops answering, the other is asked until it is back, and the
+  header says so (`via adsb.lol`).
+- **Search radius** (under Advanced): 20 to 120 nm, 30 by default. A plane that
+  crosses the disc is as far away as the target is low: a jet at cruise height is
+  about 20 km off with the target 30° up, 68 km at 10°, 137 km at 5°. So a wide
+  radius is for a low moon or sun — and means several times as many planes to follow.
   `mock` spawns fake planes that deliberately cross the target, for testing the display
   against nothing at all.
-- The sky view is centered on the target: disc to scale (the moon in its current phase,
+- The sky view is centered on the target and drawn as a dome seen from inside:
+  compass directions meet overhead, lines of equal height curve round that point, and
+  a plane passing over you flies straight through it. Disc to scale (the moon in its current phase,
   lit side turned the way you see it; yellow with a halo for the sun), faint ring = 3 radii, dashed line = where the body drifts in the
-  next 5 min, tinted band at the bottom = below the horizon.
-- Planes: dot = where the plane is *now* (extrapolated from its last fix, so it is
-  always the first point of its own line), solid line = predicted track with
-  `+30s` / `+60s` ticks and arrowheads the way the plane flies (so a line crossing
-  the view says where it comes from even while the dot is off screen; the heads are
-  drawn in perspective, growing along the line of a plane coming towards you),
-  faint line = recent trail, dashed circle + `0.4R @+37s`
-  label = closest approach with position uncertainty. Red = nominal path crosses the
+  next 5 min, tinted area below the curved horizon line = the ground.
+- Planes are drawn in perspective, so you can see which are coming towards you. The
+  small plane shape = where the plane is *now* (extrapolated from its last fix, so it
+  is always the first point of its own line), turned the way it flies and seen from
+  below; the nearer the plane, the bigger it is, and the line under its name says it
+  in words (`26 km · coming closer`). Solid line = predicted track with `+30s` /
+  `+60s` ticks and arrowheads the way the plane flies (so a line crossing the view
+  says where it comes from even while the plane is off screen). The band along the
+  track is as wide as the plane is near: it swells ahead of a plane coming towards
+  you, thins to a hair behind one going away, and stays even for one crossing
+  sideways; the same band behind the plane is its last 20 s. Dashed circle + `0.4R @+37s`
+  label = closest approach with position uncertainty. Planes move smoothly between
+  the once-a-second predictions (the same prediction, drawn for each frame's moment;
+  off when your system asks for reduced motion).
+- **The plane to scale**: zoom in, and a transit or near miss gets a small dark plane
+  at its closest approach, drawn at its real size against the disc — the wingspan of
+  its type at the distance it will have there, tipped as you will see it. That is how
+  big it will be in the shot. When the type is unknown, a mid-size airliner is assumed. Red = nominal path crosses the
   disc, orange = near miss (within 3 radii, or a possible transit within the
   uncertainty), grey = far.
 - **Fading prediction lines**: every new position report gives its own predicted
@@ -250,7 +268,9 @@ Read-only, no login (another reason to keep the server on your own network):
   distance and range. Press **Space** the moment you actually see the plane on the
   disc: the *seen* column then shows real − predicted (+ = the plane came later). A few
   rows tell a feed delay (same offset every time) apart from a height or refraction
-  error (offset that follows the ↑ motion) or a location error (follows →).
+  error (offset that follows the ↑ motion) or a location error (follows →). From
+  three marked passes on, a line under the table sums them up: the typical offset,
+  how much the marks scatter, and whether that is a steady offset at all.
   Space works anywhere except while typing in a field.
 - **On the sky view**: −/+ (or the mouse wheel) zooms, **near misses** toggles orange
   near-passes in the view, card and timetable (on by default — useful for comparing
@@ -281,9 +301,12 @@ Read-only, no login (another reason to keep the server on your own network):
   Treating both the same (as an earlier version did) left low planes drawn up to a
   disc radius too high against a low moon, which shows up as the tone coming seconds
   early on slow, rising passes.
-- Planes: geodetic → ECEF → ENU → az/el; linear dead reckoning from the last position
+- Planes: geodetic → ECEF → ENU → az/el; dead reckoning from the last position
   fix (using its timestamp, not receive time), geometric altitude preferred over
-  barometric.
+  barometric. Straight ahead, unless the last few reports all show the plane turning
+  the same way: then round that turn for 12 s and straight on from there (marked `↻`
+  in the passes list). Nothing says how long a turn lasts, so further ahead a turning
+  plane's prediction is still a guess — watch the fading lines.
 - Biggest real-world error source is feed latency: how old a position is by the time
   it arrives. On adsb.fi it is usually well under a second, but a tenth of fixes are
   several seconds old, and a stale fix is the first thing to suspect when a prediction

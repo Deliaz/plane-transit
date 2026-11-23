@@ -147,7 +147,7 @@ and the `sky` canvas palette); `body()` returns the active entry. No code outsid
 must add it to the other, or the page and the canvas will disagree. Nothing inside
 `render()` / `renderMap()` should hardcode a colour again: everything reads from
 `sky` (grid, gridText, ground, horizon, horizonText, unlit (moon only), transit, near, far,
-mapFilter, mapDim, mapRing, mapText, observer) or from the body's `disc` / `accent`.
+silhouette, mapFilter, mapDim, mapRing, mapText, observer) or from the body's `disc` / `accent`.
 Moon reads cold, sun reads warm (dark sepia, sand, faded-ink reds) — deliberately, so
 the two modes are never mistaken for each other at a glance in the field. Sun mode is
 still *dark*: it is the same night-UI shape lit warm, not a light theme.
@@ -243,7 +243,10 @@ predicted tone start/end and closest-approach `mid` (wall-clock ms), miss in R,
 the sky velocity `up`/`side` (deg/s) at closest approach, elevation, range, altitude
 and its source, ground speed, and the fix age when the tone was committed. **Space**
 sets `seen` on the most recent row whose tone was within ±15 s; the table shows
-`seen − mid`. Reading a handful of rows:
+`seen − mid`. From three marks on, `passLogOffset()` sums them up under the table:
+median offset, median deviation, and whether the offset is steady (larger than the
+scatter and than 0.3 s). Medians, so one fumbled press moves neither. It is only
+reported — never applied to a prediction. Reading a handful of rows:
 
 - the same offset whatever the geometry → a feed timing bias (latency makes real
   passes *earlier* than predicted, i.e. negative);
@@ -305,10 +308,112 @@ target (the camera follows it), in the sky view's frame: degrees from up towards
 screen right, like `target.limb`. The table and card draw it as a rotated SVG arrow
 (`dirArrow()`, `#ncDir`); with the plane off screen it is what says which edge of the
 frame it will enter from. In the sky view, `drawHeads()` puts arrowheads along each
-predicted line every `HEAD_GAP` px of screen, sized `120000 / range` (3.5-8 px): the
-one depth cue the flat sky view has. A sideways crosser keeps them even; a plane
-closing from 28 to 19 km grows them ~45% along its line. Deliberately not a drawn 3D
-arrow: a foreshortened arrow reads the same pointing in or out.
+predicted line every `HEAD_GAP` px of screen.
+
+## Sky view: the dome and the depth cues
+
+`project()` is stereographic, centred on the target, zenith up — the sky as a dome
+seen from inside. It replaced a flat chart (x = Δaz · cos el₀, y = Δel) that was right
+only near the centre: it spread the zenith over the full width, so an overhead pass
+drew a streak across the view. Things to know before touching it:
+
+- It is conformal and its scale at the centre is exactly `ppd`, so the disc, the 3 R
+  ring and the uncertainty circles stay circles, and near the target it agrees with
+  the flat frame engine.js reports in (`pred.dir`, `target.limb`, `/api/state` paths).
+  Do not "fix" those to match: they are the same thing where it matters.
+- Past ~127° from the target (`Z < -0.6`) points are held on a ring 4 rad out, in the
+  right direction. That bounds every coordinate, which the horizon relies on: it is
+  a 360-point polygon filled even-odd, not `ctx.arc` — with the target low the true
+  circle is millions of pixels across, and Safari and Firefox draw arcs as cubics.
+- Grid lines are sampled only within `reach` (the view's corner, as an angle).
+  Meridians stop at 80° except every 30°, or the zenith is a blot.
+
+Where a plane appears says nothing about whether it is coming or going; **size does**.
+Everything about a plane is scaled by `depth(range) = min(1, NEAR_M / range)`, true
+1/range perspective: the plane shape (`drawPlane()`), the band along its track and
+trail (`drawBand()`, also fading with distance) and the arrowheads. A jet closing
+from 27 to 15 km grows 80% along its line; a sideways crosser stays even. A gentler
+curve (a square root was tried on paper) flattens exactly that difference. The label's
+second line says it in words from `rangeRate()` (first two samples, ±`CLOSING_MS`).
+Sizes are *not* to scale — an airliner at 20 km spans a fifth of the disc.
+
+The plane shape is a flat model turned to its track and seen from below at the
+plane's elevation, but never flatter than `MIN_TILT` (35°): truly edge on, a low
+plane is a dash. Its attitude alone does not settle in or out (a foreshortened shape
+reads both ways — an earlier note here ruled out a 3D arrow for that reason); the
+size gradient along the band is what does, and the shape only has to agree with it:
+nose up the screen coming, down towards the horizon going.
+
+## Following a turn
+
+`planeAt()` used to be a straight line from the last report, whatever the plane was
+doing. Now `upsertPlane()` keeps the track of the last few distinct reports
+(`p.fixes`, by each report's own time) and `turnRate()` turns them into `p.turn`,
+deg/s. **It is 0 unless the reports agree**: at least three within 12 s, covering 4 s,
+every step the same way and none of them nearly flat (a flat step means the turn is
+over), at least 0.3 deg/s and 2 deg in all. ADS-B track wanders by a few tenths of a
+degree; with 0.6 deg of noise a straight flight was never once taken for a turn. And
+with `p.turn` 0, `planeAt()` runs the old lines unchanged — a test compares it with
+the old formula to the last bit. So only planes caught turning are predicted
+differently.
+
+For those, the plane flies its arc for `TURN.holdS` (12 s) past the report and
+straight on from the heading reached. Not the whole 90 s: a turn that stops early
+would be extrapolated into a circle. Measured on synthetic flights reported every
+3 s (rms position error, straight line → this):
+
+| | at +10 s | at +20 s | at +80 s |
+|---|---|---|---|
+| steady 0.4 deg/s turn | 92 → 16 m | 336 → 67 m | 5.0 → 3.6 km |
+| steady 1.5 deg/s turn | 285 → 11 m | 1032 → 193 m | 13.6 → 10.2 km |
+| 45 deg bend at 1.2 deg/s | 157 → 110 m | 541 → 404 m | 5.7 → 5.3 km |
+| 20 deg bend at 1 deg/s | 110 → 107 m | 348 → 363 m | 3.1 → 3.1 km |
+| S-turn, 30 deg each way | 134 → 106 m | 453 → 394 m | 3.7 → 4.1 km |
+
+So: a large gain where it matters for the tone (the last 20 s of a steady turn), a
+wash on short bends (the turn is half over by the time three reports show it), and up
+to 10% worse far ahead when a turn reverses. A longer hold wins more on steady turns
+and loses more on the rest; `TURN.holdS = 0` switches all of it off. `maneuvering`,
+`trust` and the error model are deliberately untouched: a gently turning plane still
+arms as before, and the passes table marks it `↻` (`⚠` stays for hard manoeuvres).
+
+## Animation
+
+`tick()` predicts once a second; `animate()` redraws the sky ~30 times a second in
+between (requestAnimationFrame, so not in a hidden tab; not with
+`prefers-reduced-motion`; not the map inset, whose filtered tiles are expensive).
+A frame computes nothing new: `posNow()` asks the same `planeAt()` + `azElRange()`
+that `predict()` uses for the frame's own moment, and at a tick it returns the tick's
+position exactly (tested). **It is extrapolation, not interpolation between reports**
+— interpolating would draw every plane one report behind. A new report that disagrees
+makes the plane jump, and it should: easing that away would hide what the fan of old
+predictions exists to show. Tracks, bands and the `+30s` ticks start from the frame's
+position too, so the arrowheads flow along with the plane.
+
+## The plane to scale
+
+For a transit or near miss with its closest approach still ahead, `render()` draws
+the plane at that point at its true size: `wingspanM(p)` (ICAO type → `WINGSPAN_M`,
+else the ADS-B size class `p.cat`, else 36 m) over `pred.rangeMin`, with its real
+tilt (no `MIN_TILT`). Dark (`sky.silhouette`) on the disc, outlined in the class
+colour when it misses. Skipped under 3 px half-span, i.e. unless zoomed in. It
+answers "how big will it be in the shot": an A320 at 20 km is a fifth of the disc, a
+777 at 12 km over half.
+
+## Search radius
+
+`cfg.radiusNm`: 20-120 nm in the UI (config.js accepts up to 249), default 30. What
+it has to cover follows from the target's elevation: a plane on the disc is
+`altitude / tan(el)` away, plus up to ~21 km for the 90 s before it gets there. At
+30 nm a cruising jet is fetched in time only with the target above ~19 deg, and not
+at all below ~12 deg. Cost, measured with 400 planes (roughly 120 nm over busy
+airspace): a tick's predictions take ~35 ms in desktop Chrome, ~0.3 ms per plane in
+Node on the same machine — expect several times that on a phone or the pi, where the
+watcher predicts every plane once a second per watched body. Drawing does not grow
+with it: `render()` leaves out planes whose trail and track stay outside the view
+(four projected points per plane), 1-4 ms a frame at 400 planes. An "auto" radius
+that follows the target's elevation is the idea on the table; nothing prefilters
+planes before `predictPlane()` yet.
 
 ## Error model
 
@@ -444,8 +549,18 @@ a record missing speed/track/altitude (`usable()`). Public failure alone is not 
 error while local data exists — that is the backup path, and it is tested by pointing
 the upstream at an unreachable host.
 
-**Not implemented:** automatic failover between the two *public* providers when one
-times out. The plumbing is trivial since both go through the same proxy path.
+**The two public feeds cover for each other** (`publicFeed()` in serve.js). A feed
+that is down — a timeout, a 5xx, a broken answer — is passed over for `FAILOVER_MS`
+(60 s) and the other one asked instead; after that it gets one try per minute with a
+2 s wait until it answers again. The waits are sized so that a failed try plus the
+other feed's answer fit inside the browser's 5 s: only the poll that discovers the
+outage is lost. A **4xx is never failed over** — that is a refusal, the back-off's
+business, and it stops every upstream request. Every request, to either feed, goes
+through `askUpstream()` and so through the one budget. The answer carries `_via`
+(→ `_meta.failover`) because the cache hands it to callers that never saw the
+failure; the header then reads `live ok (12 ac) · via adsb.lol (adsb.fi: timeout)`.
+Tested in `test/failover.test.js` against two local stand-ins (its own file: the
+budget and the back-off are per process).
 
 ## Map inset
 
@@ -534,7 +649,9 @@ every push, plus a Node 14 start-up check of serve.js). `test/load-app.js` runs
 lookup returns an inert stub, so the maths can be called directly: `parseLatLon`,
 `geoidAt`, `refrShare`, `predict` (including the sub-second refinement and the
 dead-reckoned "now"), the tone window and the arming rules — through app.js's
-wrappers, so they test engine.js as the page uses it. `test/serve.test.js` covers
+wrappers, so they test engine.js as the page uses it. `test/engine.test.js` requires
+engine.js directly for turn-following (and that a straight flight is predicted to the
+bit as before); `test/failover.test.js` covers the feeds standing in for each other. `test/serve.test.js` covers
 the static allowlist, bad requests, `/api/snap`'s guards, `mergeFeeds` and the upstream
 cap; `test/api.test.js` the settings endpoint, `/api/state`, `/metrics`, the back-off,
 the daily ceiling, gzip and the user agent; `test/watch.test.js` the watcher's pacing
@@ -596,10 +713,12 @@ When measuring the fan of ghost tracks, interpolate both curves to the same wall
    measured, it was not fresher and heard fewer aircraft (see "Data providers"), so it
    is a backup. Better antenna siting, then the receiver's streaming port, is the path
    if that changes.
-2. Linear dead reckoning breaks in turns. `maneuvering` only widens the error band, and
-   the fading prediction lines only *show* the drift; nothing corrects for it. Gentle
-   turns (under ~1 deg per poll) are not flagged as maneuvering at all.
-3. No provider failover (above).
+2. A turn is followed for 12 s and no further (see "Following a turn"): nothing says
+   how long it lasts. Past that, and for turns under 0.3 deg/s, the fading prediction
+   lines and the miss trend are still what shows the drift. The model has only met
+   synthetic flights; real turns (roll-in, roll-out, wind) will differ.
+3. The pass log's timing offset is reported, not applied. Feeding it back into the
+   prediction is the obvious next step once a few evenings agree on a number.
 4. Field validation has only just started: one evening, one report ("tone ends 3-5 s
    before the plane"), which led to the refraction and geoid fixes above. The pass log
    exists to collect more; nothing has yet confirmed the corrected frame in the field.

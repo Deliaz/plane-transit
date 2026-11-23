@@ -271,10 +271,13 @@
       <dl>
         <dt>disc</dt><dd>the target, to scale; faint ring = 3 disc radii</dd>
         <dt>R</dt><dd>one disc radius (~0.26°): 0.0 R = dead centre, under 1.0 R = on the disc</dd>
-        <dt>dot</dt><dd>where the plane is now (extrapolated from its last report)</dd>
-        <dt>line</dt><dd>predicted path, with +30 s / +60 s ticks; faint tail = recent trail</dd>
-        <dt>▸ on a line</dt><dd>the way the plane flies, even with its dot off screen. Bigger = closer to you: heads growing along a line = coming towards you</dd>
+        <dt>grid</dt><dd>the sky as a dome seen from inside: compass directions meet overhead, lines of equal height curve round that point</dd>
+        <dt>plane</dt><dd>where it is now (extrapolated from its last report), turned the way it flies and seen from below. Bigger = closer to you; under its name, how far it is and whether it is coming closer or going away</dd>
+        <dt>line</dt><dd>predicted path, with +30 s / +60 s ticks. The band along it is as wide as the plane is near: swelling ahead of the plane = coming towards you, thinning = going away. Behind the plane, the same for the last 20 s</dd>
+        <dt>▸ on a line</dt><dd>the way the plane flies, even with the plane itself off screen; they grow and shrink with the band</dd>
         <dt>fan</dt><dd>fading older predictions — if they spread, the plane is turning or the data is jumpy</dd>
+        <dt>↻</dt><dd>a steady turn: the line bends with it for the next 12 s, then runs straight. ⚠ = turning or climbing too hard to trust</dd>
+        <dt>dark plane</dt><dd>at closest approach, once you zoom in: the plane to scale against the disc — how big it will be in the shot (a mid-size airliner is assumed when the type is unknown)</dd>
         <dt>◌ + label</dt><dd>closest approach, uncertainty circle, e.g. <b>0.4R @+37s</b></dd>
         <dt>arrow</dt><dd>in the passes list and the card: the same direction at closest approach — it comes into view from the opposite side</dd>
         <dt>1.4→0.6 R</dt><dd>the miss keeps moving with each report: the plane is turning towards the disc (or away)</dd>
@@ -294,7 +297,7 @@
           <th title="Seconds until closest approach">ETA</th>
           <th title="Closest distance from the disc centre, in disc radii (R). Under 1.0 R = crosses the disc. 1.4→0.6 R = the last few reports keep moving it: the plane is turning or climbing towards the disc (or away), and the truth is likely further along">miss</th>
           <th title="Uncertainty of that miss distance, in disc radii">±</th>
-          <th title="How fresh and steady the data is. ⚠ = the plane is turning or climbing, the straight-line prediction is unreliable">trust</th></tr></thead>
+          <th title="How fresh and steady the data is. ⚠ = the plane is turning or climbing hard, the prediction is unreliable. ↻ = a steady turn the prediction is following: better than a straight line, still less sure">trust</th></tr></thead>
         <tbody></tbody>
       </table>
       <div id="passEmpty" class="empty">No close approaches predicted.</div>
@@ -322,6 +325,7 @@
         <tbody></tbody>
       </table>
       <div id="passLogEmpty" class="empty">No tones played yet.</div>
+      <div id="passLogOffset" class="note" hidden></div>
       <div class="row">
         <span class="note">Press <b>Space</b> the moment you see the plane on the disc:
           “seen” shows real − predicted (+ = later).</span>
@@ -434,12 +438,19 @@
             <option value="20">20 nm · 37 km</option>
             <option value="30">30 nm · 56 km</option>
             <option value="50">50 nm · 93 km</option>
+            <option value="65">65 nm · 120 km</option>
+            <option value="80">80 nm · 148 km</option>
+            <option value="100">100 nm · 185 km</option>
+            <option value="120">120 nm · 222 km</option>
           </select>
         </label>
         <label><input id="cfgLowAlt" type="checkbox"> include low planes (&lt;1 km)</label>
       </div>
       <div class="note">Live sources are polled every 3 s through the local server
-        (serve.js) and only while this page is open and the target is up.</div>
+        (serve.js) and only while this page is open and the target is up.
+        A plane crossing a low moon or sun is far away — a jet at cruise height is
+        68 km off with the target 10° up, 137 km at 5° — so a wide radius is for a low
+        target. It also means several times the planes to follow.</div>
     </details>
 
     <div class="pfoot">
