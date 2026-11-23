@@ -59,6 +59,36 @@ test('a feed that is down is covered by the other one, and comes back', async ()
   }
 });
 
+test('a report is aged by how old the feed\'s snapshot was when it arrived', async () => {
+  const T = 1.8e12;
+  for (const k of Object.keys(serve.feedClock)) delete serve.feedClock[k];
+  // clocks that agree: our clock minus their `now` is the age, the 2 s rhythm and all
+  assert.strictEqual(serve.feedAgeS('a', T / 1000 - 0.5, T), 0.5);
+  assert.strictEqual(serve.feedAgeS('a', T / 1000 - 0.5, T + 1000), 1.5, 'the same snapshot, a second later');
+  assert.strictEqual(serve.feedAgeS('a', (T + 1500) - 400, T + 1500), 0.4, 'a feed that counts in milliseconds');
+  assert.strictEqual(serve.feedAgeS('a', undefined, T), 0, 'no timestamp, no claim');
+  // a clock 40 s off: only the change from the freshest answer seen can be trusted
+  assert.strictEqual(serve.feedAgeS('b', T / 1000 + 40, T), 0);
+  assert.strictEqual(serve.feedAgeS('b', T / 1000 + 40, T + 1200), 1.2);
+  assert.strictEqual(serve.feedAgeS('b', T / 1000 + 41.5, T + 3000), 1.5);
+  // … and one feed's clock says nothing about another's
+  assert.strictEqual(serve.feedAgeS('c', T / 1000 - 0.2, T), 0.2);
+  // a clock set by an hour is not an hour-old snapshot
+  assert.strictEqual(serve.feedAgeS('a', T / 1000 - 0.5, T + 3600e3), 0);
+
+  // end to end: the age reaches every aircraft's seen_pos
+  serve.upstreamTimes.length = 0;
+  const fi = await feed({ now: Date.now() / 1000 - 1.5, aircraft: [PLANE] });
+  const real = serve.UPSTREAM.adsbfi;
+  delete serve.feedClock.adsbfi; delete serve.feedDown.adsbfi;
+  serve.UPSTREAM.adsbfi = () => `http://127.0.0.1:${fi.server.address().port}/`;
+  try {
+    const s = await serve.snapshot({ src: 'adsbfi', lat: 30, lon: 30, r: 30 }, null, false);
+    assert.ok(Math.abs(s.meta.feedAgeS - 1.5) < 0.2, `feedAgeS ${s.meta.feedAgeS}`);
+    assert.ok(Math.abs(s.list[0].seen_pos - (PLANE.seen_pos + 1.5)) < 0.2, `seen_pos ${s.list[0].seen_pos}`);
+  } finally { serve.UPSTREAM.adsbfi = real; fi.server.close(); }
+});
+
 test('a refusal is not a reason to ask the other feed', async () => {
   const fi = await feed({ aircraft: [PLANE] }), lol = await feed({ ac: [PLANE] });
   const real = Object.assign({}, serve.UPSTREAM);

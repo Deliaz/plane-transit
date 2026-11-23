@@ -201,6 +201,32 @@ function mergeFeeds(pub, loc) {
 
 const planesKey = (src, la, lo, r) => `${src}|${la}|${lo}|${r}`;
 
+// How old a public feed's answer already was when it reached us, in seconds. The feed
+// does not look its aircraft up per request: it hands out a snapshot it rebuilds every
+// 2 s (adsb.fi, measured), and every `seen_pos` in it counts from the snapshot's own
+// `now`, not from our request. Polling every 3 s we got a fresh one and a 1 s older one
+// in turn, and every plane was flown from a report half a second to two seconds older
+// than it claimed: 100-450 m behind for a jet, jumping by 230 m at each poll.
+// The age is our clock minus their `now`, which is only as good as the two clocks. So
+// the smallest difference seen lately (two FEED_CLOCK_MS windows, so a drifting clock
+// ages out) says which it is: within a refresh of zero, the clocks agree and the
+// difference is the age; anything else is a clock that is off, and then only the
+// change from that freshest answer is counted — still the 2 s rhythm, minus an unknown
+// constant under a refresh long. A step of a minute is a clock being set: start over.
+const FEED_CLOCK_MS = 10 * 60000;
+const feedClock = {};          // src -> { min, prev, since }: least (our clock - their now), ms
+function feedAgeS(src, theirNow, recvMs) {
+  if (typeof theirNow !== 'number' || !(theirNow > 0)) return 0;
+  const lag = recvMs - (theirNow > 1e11 ? theirNow : theirNow * 1000);   // adsb.lol counts in ms
+  let c = feedClock[src];
+  if (!c || lag - Math.min(c.min, c.prev) > 60000) c = feedClock[src] = { min: lag, prev: Infinity, since: recvMs };
+  else if (recvMs - c.since > FEED_CLOCK_MS) { c.prev = c.min; c.min = lag; c.since = recvMs; }
+  else if (lag < c.min) c.min = lag;
+  const least = Math.min(c.min, c.prev);
+  const agree = least > -300 && least < 2500;
+  return Math.max(0, (agree ? lag : lag - least) / 1000);
+}
+
 // One request to a public feed, through the one budget and the back-off.
 function askUpstream(src, la, lo, r, timeoutMs) {
   const why = upstreamRefusal();
@@ -210,7 +236,7 @@ function askUpstream(src, la, lo, r, timeoutMs) {
   }
   stats.upstreamReqs++;
   return getJSON(UPSTREAM[src](la, lo, r), timeoutMs).then(
-    d => { upstreamResult(null); return d; },
+    d => { upstreamResult(null); return Object.assign(d, { _feedAgeS: feedAgeS(src, d.now, Date.now()) }); },
     e => { upstreamResult(e); throw e; });
 }
 
@@ -278,14 +304,17 @@ async function snapshot({ src, lat, lon, r }, since = null, useLocal = !!LOCAL_U
   ]);
 
   // A snapshot shared with other browsers is up to CACHE_MS old, and the aggregator's
-  // seen_pos was measured before that. Hand on the true age: the browser dead-reckons
-  // from it, so an unaged fix quietly moves the plane by speed × cache age.
+  // seen_pos was measured before that — against a snapshot that was itself up to 2 s
+  // old when we got it (feedAgeS). Hand on the true age: the browser dead-reckons
+  // from it, so an unaged fix quietly moves the plane by speed × the age left out.
   const pub = pubEntry && pubEntry.data;
   if (pub && pub._via) meta.failover = pub._via;
   const cacheAgeS = pubEntry ? (Date.now() - pubEntry.at) / 1000 : 0;
+  const feedS = (pub && pub._feedAgeS) || 0, agedS = cacheAgeS + feedS;
   const pubList = (pub ? (pub.aircraft || pub.ac || []) : [])
-    .map(a => (cacheAgeS > 0.05 ? Object.assign({}, a, { seen_pos: ageOf(a) + cacheAgeS }) : a));
+    .map(a => (agedS > 0.05 ? Object.assign({}, a, { seen_pos: ageOf(a) + agedS }) : a));
   meta.cacheAgeS = Number(cacheAgeS.toFixed(2));
+  meta.feedAgeS = Number(feedS.toFixed(2));
   if (!pub && !loc.length) return { ok: false, at: Date.now(), list: [], meta };
   const merged = mergeFeeds(pubList, loc);
   meta.public = pubList.filter(usable).length;
@@ -519,5 +548,5 @@ function main() {
 
 if (require.main === module) main();
 module.exports = { handle, usable, mergeFeeds, upstreamAllowed, upstreamRefusal, upstreamResult, stats,
-  snapshot, UPSTREAM, feedDown, FAILOVER_MS, upstreamTimes,
+  snapshot, UPSTREAM, feedDown, FAILOVER_MS, upstreamTimes, feedAgeS, feedClock,
   getJSON, loadSettings, watcher, UPSTREAM_MAX, UPSTREAM_WINDOW_MS, UPSTREAM_DAILY_MAX, SNAP_MAX };

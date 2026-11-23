@@ -212,7 +212,9 @@ Read-only, no login (another reason to keep the server on your own network):
   sideways; the same band behind the plane is its last 20 s. Dashed circle + `0.4R @+37s`
   label = closest approach with position uncertainty. Planes move smoothly between
   the once-a-second predictions (the same prediction, drawn for each frame's moment;
-  off when your system asks for reduced motion).
+  off when your system asks for reduced motion). When a new report moves a plane a
+  little, its marker slides there over a second and a half instead of jumping; the
+  track and the numbers switch at once.
 - **The plane to scale**: zoom in, and a transit or near miss gets a small dark plane
   at its closest approach, drawn at its real size against the disc — the wingspan of
   its type at the distance it will have there, tipped as you will see it. That is how
@@ -308,7 +310,9 @@ Read-only, no login (another reason to keep the server on your own network):
   in the passes list). Nothing says how long a turn lasts, so further ahead a turning
   plane's prediction is still a guess — watch the fading lines.
 - Biggest real-world error source is feed latency: how old a position is by the time
-  it arrives. On adsb.fi it is usually well under a second, but a tenth of fixes are
+  it arrives. On adsb.fi a position is typically 1-2 s old — the feed hands out a
+  snapshot it rebuilds every 2 s, and the server adds that snapshot's age to every
+  report, so planes are flown from the right moment — but a tenth of fixes are
   several seconds old, and a stale fix is the first thing to suspect when a prediction
   misbehaves. A local receiver can be merged in (above); measured against adsb.fi it
   was not fresher, and it heard fewer aircraft, so it is a backup rather than an

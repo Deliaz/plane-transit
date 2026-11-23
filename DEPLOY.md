@@ -181,6 +181,12 @@ the 30 nm search radius** — against 16-40 from adsb.fi. What it does hear, it 
 well: median gaps between position messages were 0.5 s (32.6 km, 20° elevation), 0.6 s
 (33.6 km, 1.4°) and 0.5-1.1 s for the rest, out to 102 km.
 
+(Correction, Nov 2026: the public figure in the table below leaves out the age of
+adsb.fi's own snapshot, 0.5-2 s on arrival, which the server now measures and adds. The
+public path is really 1-2.5 s old, and the stream would beat it by a second or more —
+but only for the few aircraft the antenna hears, and a *known* age costs little, so the
+conclusion stands.)
+
 So the arithmetic for a transit candidate, with one browser open:
 
 | path | typical age of the fix the browser uses |

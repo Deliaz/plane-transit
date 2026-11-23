@@ -198,9 +198,25 @@ every browser for up to `CACHE_MS`, and the local `aircraft.json` is up to a sec
 when read. Both paths add that age to each aircraft's `seen_pos` before answering
 (`_meta.cacheAgeS` reports it). Forget this and the browser dead-reckons from a
 timestamp that claims to be fresher than it is — ~500 m of silent along-track error for
-an airliner on a 2.5 s cache. Do not pass an aggregator's `now` field through as a
-correction: the skew between their clock and ours is unknown. Only our own cache age is
-exactly known, and only the local receiver shares our clock.
+an airliner on a 2.5 s cache.
+
+**The public feed's answer is itself a snapshot, and its age counts too** (`feedAgeS()`
+in serve.js, `_meta.feedAgeS`). adsb.fi rebuilds what it hands out every 2 s, and every
+`seen_pos` in it counts from the snapshot's `now`, not from our request. Measured on
+live traffic (Nov 2026): polled every 3 s, the answer was 0.7 and 1.7 s old in turn, so
+positions advanced by 2 s and 4 s of flight alternately while `seen_pos` said "0.2 s"
+every time. Every plane was drawn 0.5-2 s (100-450 m for a jet) behind where it was,
+and corrected by ±230 m at each poll — 99% of corrections were over 50 m. With the
+snapshot's age added, the median correction is 5 m and 1% are over 50 m.
+This overturns an earlier rule here ("do not use the aggregator's `now`: the skew
+between their clock and ours is unknown"). The skew *is* unknown, so it is measured:
+the smallest `our clock − their now` seen in the last 10-20 minutes. If that is within
+a refresh of zero (-0.3 to 2.5 s) the clocks agree — any NTP-synced box — and the
+difference is taken as the age. If not, only the change from that freshest answer is
+counted: the 2 s rhythm is still removed, an unknown constant under one refresh is
+not. A jump of a minute is a clock being set, and starts the measurement over.
+adsb.lol's `now` is in milliseconds; both are handled. The local receiver needs none
+of this: it shares our clock.
 
 **Extrapolate from the position timestamp, not from now.** `posTime` is
 `Date.now() - seen_pos*1000`. Feed latency (2-15 s on public aggregators) is the
@@ -379,16 +395,45 @@ arms as before, and the passes table marks it `↻` (`⚠` stays for hard manoeu
 
 ## Animation
 
+**Drawing must never change a prediction, and a test holds it to that**
+(`drawing changes nothing that the prediction, the alerts or the tone read`): the same
+traffic through two fresh pages, one drawing thirty frames a tick and one never
+drawing, must give byte-identical predictions, classes, trust, miss trend, arming and
+tone windows. The only thing drawing writes to a plane is `p.drawn`, which only
+`shownPos()` reads. Keep it so: anything new that a frame wants to remember goes there,
+never into a field `predict()`, `checkAlerts()` or `countdownLoop()` look at. Drawing
+also shares one thread with the 20 Hz tone scheduler, so `animate()` gives itself at
+most a quarter of it: after a frame that took `x` ms it waits at least `4x` (and never
+less than 30 ms).
+
 `tick()` predicts once a second; `animate()` redraws the sky ~30 times a second in
 between (requestAnimationFrame, so not in a hidden tab; not with
 `prefers-reduced-motion`; not the map inset, whose filtered tiles are expensive).
 A frame computes nothing new: `posNow()` asks the same `planeAt()` + `azElRange()`
 that `predict()` uses for the frame's own moment, and at a tick it returns the tick's
 position exactly (tested). **It is extrapolation, not interpolation between reports**
-— interpolating would draw every plane one report behind. A new report that disagrees
-makes the plane jump, and it should: easing that away would hide what the fan of old
-predictions exists to show. Tracks, bands and the `+30s` ticks start from the frame's
-position too, so the arrowheads flow along with the plane.
+— interpolating would draw every plane one report behind. Tracks, bands and the
+`+30s` ticks start from the frame's position too, so the arrowheads flow along with
+the plane.
+
+**The drawn plane slides to a new report; it does not jump** (`shownPos()`). Once the
+motion was smooth, every new report showed as a twitch. Nearly all of that was the
+feed's snapshot age (above), fixed where it arises; what is left is the honest
+disagreement between two reports — 5 m typically, 15 m at the 90th percentile, more
+when a late report or a turn comes in — and that is what gets eased.
+`shownPos()` remembers the report a plane was last drawn from; when it changes, the
+offset between the old track flown on to this frame and the new position is kept as
+`p.drawn.slip` and eased to zero over `SLIP_S` (1.5 s, smoothstep; a correction
+arriving mid-slide starts from wherever the marker is). A typical correction is a
+fraction of a second of flight, so the plane slows a little or hurries a little and
+never backs up. **Only the marker does this.** `p.az` / `p.el`, the track, the miss,
+the tables and the tone switch to the new report at once — `posNow()` stays the raw
+position and is what the tests compare with a tick. A correction over `SLIP_MAX_M`
+(1.5 km) still jumps: that is not timing noise, it is news, and the fan of old
+predictions shows the same thing. A plane not drawn for 2 s (off screen, hidden tab)
+starts fresh. The cost is honesty of the marker for up to 1.5 s after a report: it can
+be a few tens of metres from the best estimate, which matters only to someone judging
+a crossing by eye in that instant rather than by the tone.
 
 ## The plane to scale
 
@@ -521,6 +566,13 @@ limit and can earn a temporary IP block.
 |---|---|---|---|
 | adsb.fi | 40 | 0.3 s | 4.6 s |
 | local receiver | 16 | 4.4 s | 25.8 s |
+
+**Read that table with the snapshot age in mind** (found Nov 2026, see "Age every
+snapshot you hand on"): adsb.fi's `seen_pos` counts from a snapshot that is 0.5-2 s old
+on arrival, so its real median age was nearer 1.5 s than 0.3 s — about the same as the
+receiver's, not fresher. The conclusion below survives on coverage, and because an age
+that is *known* costs almost nothing in straight flight; `mergeFeeds()` now compares
+true ages, so a local record wins more often than it did.
 
 That is worth internalising: the public feed is currently **fresher and wider** than
 the receiver, so the old "latency 2-15 s dominates everything" note below is pessimistic

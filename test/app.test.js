@@ -243,3 +243,76 @@ test('between ticks a plane is drawn where the same dead reckoning puts it', () 
   assert.ok(out[1] < 1e-9 && Math.abs(out[2]) < 1e-6, `same place as a tick would draw: ${out[1]} deg, ${out[2]} m`);
   assert.strictEqual(out[4], null, 'no sample past the end of the track');
 });
+
+test('a new report slides the drawn plane to its place instead of jumping it', () => {
+  placeObserver(run, 52.37, 4.89, 2);
+  const out = run(`(() => {
+    const t0 = 1.7e12, fix = (lat, lon, ageS) => ({ hex: 'slip', flight: 'SLIP', lat, lon, altM: 10000, gs: 230, track: 110, vr: 0, ageS, altSrc: 'geom', feed: 'test' });
+    const metres = (a, b) => Math.hypot(wrapDeg(a.az - b.az) * Math.cos(b.el * D2R) * D2R * b.range, (a.el - b.el) * D2R * b.range, a.range - b.range);
+    const sky = pos => azElRange(pos.lat, pos.lon, pos.h);
+    updateTarget(new Date(t0)); planes.clear();
+    PTE.upsertPlane(planes, fix(52.50, 4.60, 1), t0);
+    const p = planes.get('slip'), old = Object.assign({}, p);
+    predict(p, t0);
+    const first = metres(shownPos(p, t0 + 500), posNow(p, t0 + 500));
+    shownPos(p, t0 + 2980);                               // the frame before the new report
+    // the new report, 3 s on: the plane is 120 m behind where the old one had flown it
+    const t1 = t0 + 3000, there = planeAt(old, 4), back = 120 / 111320;
+    PTE.upsertPlane(planes, fix(there.lat - back * Math.cos(110 * D2R), there.lon - back * Math.sin(110 * D2R) / Math.cos(there.lat * D2R), 0), t1);
+    const at = ms => [metres(shownPos(p, t1 + ms), sky(planeAt(old, 4 + ms / 1000))), metres(shownPos(p, t1 + ms), posNow(p, t1 + ms))];
+    const start = at(10), half = at(750), done = at(1600);
+    // one that is far too big to be timing noise: 3 km
+    predict(p, t1 + 1600); shownPos(p, t1 + 2980);
+    const far = planeAt(p, 3), t2 = t1 + 3000;
+    PTE.upsertPlane(planes, fix(far.lat - 3000 / 111320, far.lon, 0), t2);
+    return [first, start, half, done, metres(shownPos(p, t2 + 10), posNow(p, t2 + 10))];
+  })()`);
+  assert.ok(out[0] < 1e-6, 'nothing to ease before any correction');
+  assert.ok(out[1][0] < 1 && Math.abs(out[1][1] - 120) < 3, `starts where it was being drawn: ${[...out[1]]}`);
+  assert.ok(out[2][1] > 40 && out[2][1] < 80, `half way there after half the time: ${out[2][1]}`);
+  assert.ok(out[3][1] < 1e-6, 'and then it is exactly where the new report puts it');
+  assert.ok(out[4] < 1e-6, 'a 3 km correction is not eased');
+});
+
+test('drawing changes nothing that the prediction, the alerts or the tone read', () => {
+  // The same six ticks of the same traffic in two fresh pages: one never draws, the
+  // other draws thirty frames a tick (sky, map, eased markers). Everything a
+  // prediction is, and everything the countdown decides from it, must come out equal.
+  const scenario = draw => {
+    const page = loadApp();
+    placeObserver(page, 52.37, 4.89, 2);
+    return page(`(() => {
+      const T = 1.7504e12, out = [];                               // the moon 45 deg up from here
+      cfg.spanDeg = 20; cfg.showMap = true;
+      updateTarget(new Date(T));
+      const aim = pointAt(target.az, target.el, 22000);            // one plane headed for the disc
+      const fixes = [
+        t => ({ lat: aim.lat - 0.0018 * (40 - t), lon: aim.lon - 0.0009 * (40 - t), altM: aim.h, gs: 228, track: 16.5 + 0.9 * t, vr: 0 }),   // turning
+        t => ({ lat: aim.lat + 0.0019 * (35 - t), lon: aim.lon, altM: aim.h, gs: 211, track: 180, vr: 0 }),
+        t => ({ lat: 52.60 + 0.001 * t, lon: 4.40 + 0.002 * t, altM: 11200, gs: 240, track: 51, vr: 2 }),
+        t => ({ lat: 52.10, lon: 5.30 - 0.003 * t, altM: 9400, gs: 205, track: 270, vr: -4 }),
+      ];
+      for (let k = 0; k < 6; k++) {
+        const now = T + k * 1000;
+        if (k % 3 === 0 || k === 4) fixes.forEach((f, i) => PTE.upsertPlane(planes,
+          Object.assign({ hex: 'h' + i, flight: 'F' + i, ageS: 0.8 + 0.3 * i, altSrc: 'geom', feed: 'test' }, f(k)), now));
+        updateTarget(new Date(now));
+        for (const p of planes.values()) predict(p, now);
+        if (${draw}) {
+          render(now);
+          for (let i = 1; i < 30; i++) { render(now + i * 33, true); for (const p of planes.values()) shownPos(p, now + i * 33 + 7); }
+        }
+        out.push([...planes.values()].map(p => ({
+          hex: p.hex, az: p.az, el: p.el, range: p.range, sepNow: p.sepNow, age: p.age, posTime: p.posTime,
+          trust: p.trust, klass: p.klass, turn: p.turn, maneuvering: p.maneuvering, pred: p.pred,
+          trail: p.trail, ghosts: p.ghosts.length, miss: missFrom(p), worthy: alertWorthy(p), tone: toneWindow(p.pred),
+        })));
+      }
+      return JSON.stringify(out);
+    })()`);
+  };
+  const quiet = scenario(false), drawn = scenario(true);
+  assert.ok(quiet.length > 20000 && /"klass":"(transit|near)"/.test(quiet) && /"turn":0\.[0-9]/.test(quiet),
+    'the scenario has a close pass and a turning plane in it');
+  assert.strictEqual(drawn, quiet);
+});

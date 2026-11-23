@@ -390,6 +390,39 @@ function posNow(p, frameMs) {
   const pos = planeAt(p, (frameMs - p.posTime) / 1000);
   return azElRange(pos.lat, pos.lon, pos.h);
 }
+// A new report never agrees with the old one's dead reckoning to the metre: report
+// times are only known to a few tenths of a second, which at a jet's speed is 50-150 m.
+// Drawn as it comes, the plane twitches back or forth every few seconds. So the
+// *drawn* plane slides to where the new report puts it over SLIP_S instead: it starts
+// from where it was being drawn, and the difference is eased away. Only the marker
+// does this. The prediction, the track, the numbers and the tone switch to the new
+// report at once; and a correction too big to be timing noise (SLIP_MAX_M) still
+// jumps, because that one is news.
+const SLIP_S = 1.5, SLIP_MAX_M = 1500;
+const slipLeft = ms => { const x = ms / (SLIP_S * 1000); return x >= 1 ? 0 : 1 - x * x * (3 - 2 * x); };
+function shownPos(p, frameMs) {
+  const raw = posNow(p, frameMs);
+  if (!Number.isFinite(p.lat)) return raw;
+  const key = p.posTime + '|' + p.lat + '|' + p.lon + '|' + p.track + '|' + p.gs + '|' + (p.turn || 0);
+  let d = p.drawn;
+  if (!d || d.key !== key) {
+    let slip = null;
+    if (d && frameMs - d.at < 2000) {       // it was on screen a moment ago: carry on from there
+      const pos = planeAt(d.fix, (frameMs - d.fix.posTime) / 1000), old = azElRange(pos.lat, pos.lon, pos.h);
+      const w = d.slip ? slipLeft(frameMs - d.slip.t0) : 0;
+      slip = { az: wrapDeg(old.az - raw.az) + (w ? d.slip.az * w : 0), el: old.el - raw.el + (w ? d.slip.el * w : 0),
+        range: old.range - raw.range + (w ? d.slip.range * w : 0), t0: frameMs };
+      const m = Math.hypot(slip.az * Math.cos(raw.el * D2R), slip.el) * D2R * raw.range;
+      if (!(Math.hypot(m, slip.range) < SLIP_MAX_M)) slip = null;
+    }
+    d = p.drawn = { key, slip, at: frameMs,
+      fix: { lat: p.lat, lon: p.lon, altM: p.altM, gs: p.gs, track: p.track, vr: p.vr, turn: p.turn, posTime: p.posTime } };
+  }
+  d.at = frameMs;
+  const w = d.slip ? slipLeft(frameMs - d.slip.t0) : 0;
+  if (!w) { d.slip = null; return raw; }
+  return { az: raw.az + d.slip.az * w, el: raw.el + d.slip.el * w, range: raw.range + d.slip.range * w };
+}
 // a predicted track t seconds after its tick, between its 2 s samples (null past the end)
 function sampleAt(samples, t) {
   const i = samples.findIndex(s => s.t >= t);
@@ -536,7 +569,7 @@ function render(frameMs = Date.now(), skyOnly = false) {
     // drawBand): the trail fainter, the prediction under its line.
     const far = k === 'far', wide = far ? 3.5 : 5;
     // both start at the plane as it is this frame, not at the last tick's position
-    const cur = posNow(p, frameMs), lead = Math.max(0, (frameMs - p.pred.at) / 1000);
+    const cur = shownPos(p, frameMs), lead = Math.max(0, (frameMs - p.pred.at) / 1000);
     const ahead = [cur].concat(p.pred.samples.filter(s => s.t > lead + 0.05));
     const behind = p.trail.concat(cur);
     const path = ahead.map(s => project(s.az, s.el, cx, cy, ppd));
@@ -612,7 +645,7 @@ function render(frameMs = Date.now(), skyOnly = false) {
   }
 
   for (const p of shown) {
-    const cur = posNow(p, frameMs);
+    const cur = shownPos(p, frameMs);
     const [x, y] = project(cur.az, cur.el, cx, cy, ppd);
     if (x < -80 || y < -80 || x > W + 80 || y > H + 80) continue;
     const half = Math.max(4.5, 26 * depth(cur.range));   // half the wingspan, px
@@ -1748,13 +1781,18 @@ setInterval(tick, 1000);
 // own moment, ~30 times a second. Nothing is computed that a tick does not compute,
 // so with reduced motion asked for (or no frames, in a hidden tab) the view is just
 // the once-a-second one again.
+// Drawing reads the planes and writes nothing the prediction, the tables or the tone
+// read (a test holds it to that). What it could still do is hog the one thread the
+// 20 Hz tone scheduler and the tick run on, so it never takes more than a quarter of
+// it: a frame that took 20 ms to draw is followed by 80 ms of nothing.
 const calmMotion = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
-let lastFrame = 0;
+let nextFrame = 0;
 function animate(ts) {
   requestAnimationFrame(animate);
-  if (!started || !target || !planes.size || (calmMotion && calmMotion.matches) || ts - lastFrame < 30) return;
-  lastFrame = ts;
+  if (!started || !target || !planes.size || (calmMotion && calmMotion.matches) || ts < nextFrame) return;
+  const t0 = performance.now();
   render(Date.now(), true);
+  nextFrame = ts + Math.max(30, 4 * (performance.now() - t0));
 }
 if (window.requestAnimationFrame) requestAnimationFrame(animate);
 setInterval(countdownLoop, 50);
