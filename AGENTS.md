@@ -115,7 +115,9 @@ Sorted by how often a photographer touches it, not by when it was built:
 - **On the sky view, mid-session:** the `#nextCard` (lead plane: the armed countdown
   first, else the first transit / shown near miss; redrawn at 10 Hz — it is what you
   read from a metre away with the camera up), zoom −/+ (and the wheel) over
-  `SPANS`, near-miss filter, map toggle, `?` legend. `#skyState` replaces an empty
+  `SPANS`, near-miss filter, map toggle, `?` legend. A click on the map inset enlarges
+  it over the sky view (see "The map"): the same −/+ then zoom the map, ⌖ recentres,
+  the toggle reads "sky view", and the legend shows the map's own marks. `#skyState` replaces an empty
   sky when the target is down: rise time and direction, when it clears `GOOD_EL`,
   and a switch to the other body if that one is up (still through the sun gate).
 - **Sidebar:** predicted passes open; all tracked planes and the pass log are
@@ -614,13 +616,73 @@ failure; the header then reads `live ok (12 ac) · via adsb.lol (adsb.fi: timeou
 Tested in `test/failover.test.js` against two local stand-ins (its own file: the
 budget and the back-off are per process).
 
-## Map inset
+## The map
 
 Real OpenStreetMap raster tiles, drawn to canvas with `crossOrigin='anonymous'` so the
-canvas stays untainted (the `/api/snap` debug path below needs `toBlob`). Tiles are
-CSS-filtered to dark to match the UI. Web Mercator inflates ground distance by
-`1/cos(lat)`, which is why `scale` and the range rings divide by `cosLat` — drop that
-and the rings will be wrong by ~60% at this latitude. Keep the OSM attribution.
+canvas stays untainted (the `/api/snap` debug path below needs `toBlob`). Web Mercator
+inflates ground distance by `1/cos(lat)`: `mapFrame()` works in px per *Mercator* metre
+(`scale`) and hands out `ppm(lat)`, px per ground metre — drop the cosine and the rings
+will be wrong by ~60% at this latitude. Keep the OSM attribution.
+
+`#mapBox` holds two canvases. `#mapTiles` is the tiles, darkened by a **CSS** filter
+(`sky.mapFilter`; a canvas `ctx.filter` costs a full-canvas pass per draw and Safari
+has not got it) and redrawn only when the view moves or a tile arrives (`tilesKey`,
+`tilesStale`). `#map` on top is everything of ours, about 0.1 ms a frame. A tile that
+has not arrived is filled from a coarser one already held. `tileCache` is
+least-recently-used, 400 tiles.
+
+Two states, one renderer (`renderMap(frameMs, fresh)`):
+- **inset**: you in the middle, the search radius to the edge, drawn once a tick;
+- **enlarged** (`mapView.big`, a click on the inset): it covers the sky view, so
+  `render()` draws it *instead of* the sky, every animation frame. Drag, wheel, pinch
+  and double-click move it (`panMap`, `zoomMap`: `mapView.zoom` multiplies the fitted
+  scale, `lat`/`lon` is the centre, null while it follows the observer). The sky view's
+  −/+ zoom the map while it is up and the figure between them is the width of ground
+  shown (`renderSkyCtl`). `mapView` is not saved: a reload opens on the sky.
+
+### The ground under a crossing
+
+The enlarged map exists for one thing: for each plane, the line on the ground from
+which it is seen on the centre of the disc. `engine.js` has the maths —
+`bodyEcef(site, key, date)`, the body's centre as a point in space, and
+`transitPoint(B, pos, groundH)`, where the line from that point through a plane comes
+down at ellipsoidal height `groundH`. `h / tan(elevation)` beyond the plane, away from
+the body: 17 km for a jet at 10 km with the target 30° up, 57 km at 10°.
+
+- It is held to the prediction's frame, not derived beside it: after the straight
+  line gives a first place, `transitPoint` asks `azElRange()` what that place would
+  see (the plane with its share of refraction) against the body with all of it, and
+  steps until they agree to 2e-5°. Two or three steps; ~1.6 µs a call.
+  `test/ground.test.js` stands an observer on the result and has `predictPlane()`
+  report a transit there at that second, within 0.02 R.
+- A point, not a direction, for the body: the moon's parallax between two places 50 km
+  apart is 0.03 R, and comes out by itself. Between `bodyEcef(now)` and
+  `bodyEcef(now + 120 s)` the page interpolates in a straight line (0.0005° off).
+- `null` when there is nowhere to stand: the body under 1°, the plane less than 30 m
+  above `groundH`, or the line running past `CAST_MAX_M` (400 km) — with the body low
+  it never comes down at all, the Earth curves away under it.
+- `groundH` is the observer's own height (`site().h`), the only one known. That makes
+  the line through the observer's dot exactly the pass the prediction reports
+  (`test/app.test.js` checks the two agree in disc radii), and makes every other place
+  wrong by its height difference over `tan(el)`. No terrain model: do not add a
+  network lookup per point.
+- `castTracks()` builds one list per plane on every tick the map is drawn (10 s steps,
+  3 s for a turning plane; ~0.03 ms a plane). Between ticks `castFrom()` moves the
+  same list on to the frame's moment. They live in `casts`, **not on the plane
+  record** — nothing the prediction reads is touched, and the drawing-changes-nothing
+  test runs a third page with the map enlarged to hold that.
+- The band: the disc's footprint at a point is an ellipse, `angR × range` across the
+  line of sight and that over `sin(el)` along it. Its half-width square to the line is
+  what is drawn. It means the plane's *centre* is on the disc — the same thing
+  `klass === 'transit'` means. Close to an airport a plane is larger than the disc
+  and touches it from further out; that is not drawn.
+- In the inset, traffic that is `far` gets the bare line only: with forty planes every
+  mark on every one buries the two that matter.
+
+What it does not do yet: remember. The lines are the next 90 s of the planes in the
+air now, and the corridor on the ground moves with the body, so they are not a map of
+where to stand in an hour. That needs the flights kept (position, height, time) and
+their lines recomputed for a chosen moment — see "Known limitations".
 
 ## Audio
 
@@ -703,7 +765,7 @@ lookup returns an inert stub, so the maths can be called directly: `parseLatLon`
 dead-reckoned "now"), the tone window and the arming rules — through app.js's
 wrappers, so they test engine.js as the page uses it. `test/engine.test.js` requires
 engine.js directly for turn-following (and that a straight flight is predicted to the
-bit as before); `test/failover.test.js` covers the feeds standing in for each other. `test/serve.test.js` covers
+bit as before); `test/ground.test.js` for the ground under a crossing; `test/failover.test.js` covers the feeds standing in for each other. `test/serve.test.js` covers
 the static allowlist, bad requests, `/api/snap`'s guards, `mergeFeeds` and the upstream
 cap; `test/api.test.js` the settings endpoint, `/api/state`, `/metrics`, the back-off,
 the daily ceiling, gzip and the user agent; `test/watch.test.js` the watcher's pacing
@@ -780,6 +842,12 @@ When measuring the fan of ghost tracks, interpolate both curves to the same wall
    readable, the hook is already in place: add a third variant to the `body.sun` CSS
    block and a matching `sky` palette, rather than special-casing colours at the call
    sites.
-6. The tone is committed ~0.1 s before it starts and does not follow a prediction
+6. The map's crossing lines are live only (see "The map"). Planning where to stand
+   later — near an airport, say — needs the last hour's flights kept and their lines
+   recomputed for the moment asked about, because the corridor moves with the target;
+   and the runway in use changes with the wind, so even that only holds while the
+   traffic pattern does. Heights there come from pressure altitude as often as GNSS,
+   and close to the runway 50 m of height is 140 m of ground with the target 20° up.
+7. The tone is committed ~0.1 s before it starts and does not follow a prediction
    that shifts while it plays (a new fix mid-tone). Fine for a steady bias; a
    refinement if the log shows late jumps.

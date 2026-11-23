@@ -88,10 +88,17 @@
   #main { flex: 1; display: flex; min-height: 0; }
   #skyWrap { flex: 1; position: relative; min-width: 0; overflow: hidden; }
   #sky { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  #map {
-    position: absolute; left: 10px; bottom: 10px; width: 260px; height: 260px;
-    background: var(--mapbg); border: 1px solid var(--border); border-radius: 6px;
+  /* the map: an inset over the sky view, or — clicked — the whole view (.big) */
+  #mapBox {
+    position: absolute; left: 10px; bottom: 10px; width: 260px; height: 260px; overflow: hidden;
+    background: var(--mapbg); border: 1px solid var(--border); border-radius: 6px; cursor: zoom-in;
   }
+  #mapBox canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #mapBox.big {
+    inset: 0; width: auto; height: auto; border: 0; border-radius: 0; background: var(--bg);
+    cursor: grab; touch-action: none;
+  }
+  #mapBox.big:active { cursor: grabbing; }
   .glass { background: var(--mapbg); border: 1px solid var(--border); border-radius: 8px; }
   #nextCard {
     position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
@@ -216,7 +223,7 @@
     #sidebar { width: auto; flex: none; overflow: visible; border-left: none; border-top: 1px solid var(--border); }
     body { height: auto; min-height: 100%; }
     #skyWrap { flex: none; height: 62vh; min-height: 340px; }
-    #map { width: 150px; height: 150px; bottom: 50px; }   /* above the controls row */
+    #mapBox { width: 150px; height: 150px; bottom: 50px; }   /* above the controls row */
     #skyCtl { left: 10px; flex-wrap: nowrap; }
     #nextCard { min-width: 0; width: calc(100% - 20px); }
     #nextCard .eta { font-size: 34px; }
@@ -250,7 +257,10 @@
 <div id="main">
   <div id="skyWrap">
     <canvas id="sky"></canvas>
-    <canvas id="map"></canvas>
+    <div id="mapBox" title="Click to enlarge: where on the ground each plane crosses the disc" hidden>
+      <canvas id="mapTiles"></canvas>
+      <canvas id="map"></canvas>
+    </div>
     <div id="nextCard" class="glass" hidden>
       <div class="top"><b id="ncFlight"></b><span class="badge" id="ncBadge"></span><span id="ncArmed"></span></div>
       <div class="eta"><span id="ncDir"><svg class="dir" viewBox="-6 -6 12 12" aria-hidden="true"><path d="M0-5.5 5 1H1.6V5.5H-1.6V1H-5Z" fill="currentColor"/></svg></span><span id="ncEta"></span></div>
@@ -264,11 +274,24 @@
         <button type="button" id="spanIn" title="Zoom in" aria-label="Zoom in">+</button>
       </span>
       <span class="glass"><button type="button" id="btnNear" title="Also show close passes that miss the disc">near misses</button></span>
+      <span class="glass" id="mapHomeWrap" hidden><button type="button" id="btnMapHome" title="Back to your position and the whole search radius" aria-label="Centre the map on you">⌖</button></span>
       <span class="glass"><button type="button" id="btnMapToggle" title="Top-down map">map</button></span>
       <span class="glass"><button type="button" id="btnLegend" title="What the marks mean" aria-label="Legend">?</button></span>
     </div>
     <div id="legend" class="glass" hidden>
-      <dl>
+      <dl id="legendMap" hidden>
+        <dt>line</dt><dd>where on the ground that plane crosses the centre of the disc over the next 90 s. Stand on it and you get a transit; the line through your own dot is the pass the sky view counts down</dd>
+        <dt>○</dt><dd>that spot right now, tied to its plane by the dotted link: the lower the target, the further from the plane</dd>
+        <dt>band</dt><dd>zoom in: as wide as the disc. Anywhere inside it the plane's centre is on the disc</dd>
+        <dt>▲</dt><dd>the plane, pointing the way it flies, and the ground under its next 90 s</dd>
+        <dt>rings</dt><dd>distance from you. Dashed: the search radius — planes beyond it are not known, so their lines are missing</dd>
+        <dt>wedge</dt><dd>what the sky view covers; the dashed ray points at the target</dd>
+        <dt class="c-transit">red</dt><dd>crosses the disc from where you are</dd>
+        <dt class="c-near">orange</dt><dd>near miss from where you are</dd>
+        <dt>limits</dt><dd>the ground is taken to be at your own height, and a plane's reported height can be tens of metres off: near an airport that moves a line by a few times as much</dd>
+        <dt>move</dt><dd>drag, scroll or pinch; ⌖ brings you back</dd>
+      </dl>
+      <dl id="legendSky">
         <dt>disc</dt><dd>the target, to scale; faint ring = 3 disc radii</dd>
         <dt>R</dt><dd>one disc radius (~0.26°): 0.0 R = dead centre, under 1.0 R = on the disc</dd>
         <dt>grid</dt><dd>the sky as a dome seen from inside: compass directions meet overhead, lines of equal height curve round that point</dd>
@@ -285,6 +308,7 @@
         <dt class="c-near">orange</dt><dd>near miss, or a possible transit within the uncertainty</dd>
         <dt>grey</dt><dd>everything else</dd>
         <dt>dashed</dt><dd>where the target drifts over the next 5 min</dd>
+        <dt>map</dt><dd>click it to enlarge: it shows where on the ground each plane crosses the disc</dd>
       </dl>
     </div>
   </div>

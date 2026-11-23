@@ -278,12 +278,12 @@ test('drawing changes nothing that the prediction, the alerts or the tone read',
   // The same six ticks of the same traffic in two fresh pages: one never draws, the
   // other draws thirty frames a tick (sky, map, eased markers). Everything a
   // prediction is, and everything the countdown decides from it, must come out equal.
-  const scenario = draw => {
+  const scenario = (draw, bigMap = false) => {
     const page = loadApp();
     placeObserver(page, 52.37, 4.89, 2);
     return page(`(() => {
       const T = 1.7504e12, out = [];                               // the moon 45 deg up from here
-      cfg.spanDeg = 20; cfg.showMap = true;
+      cfg.spanDeg = 20; cfg.showMap = true; mapView.big = ${bigMap};
       updateTarget(new Date(T));
       const aim = pointAt(target.az, target.el, 22000);            // one plane headed for the disc
       const fixes = [
@@ -311,8 +311,49 @@ test('drawing changes nothing that the prediction, the alerts or the tone read',
       return JSON.stringify(out);
     })()`);
   };
-  const quiet = scenario(false), drawn = scenario(true);
+  const quiet = scenario(false), drawn = scenario(true), mapped = scenario(true, true);
   assert.ok(quiet.length > 20000 && /"klass":"(transit|near)"/.test(quiet) && /"turn":0\.[0-9]/.test(quiet),
     'the scenario has a close pass and a turning plane in it');
   assert.strictEqual(drawn, quiet);
+  assert.strictEqual(mapped, quiet, 'the enlarged map, with its crossing lines, changes nothing either');
+});
+
+test('on the map, the line of a plane that transits runs over the observer when it does', () => {
+  // The map's ground lines and the prediction are two routes to the same answer: how
+  // far the observer stands from a plane's line, measured in the disc's own footprint
+  // there, is the miss the prediction reports in disc radii.
+  const page = loadApp();
+  placeObserver(page, 52.37, 4.89, 2);
+  const out = JSON.parse(page(`(() => {
+    const T = 1.7504e12, res = [];
+    updateTarget(new Date(T));
+    const aim = pointAt(target.az, target.el, 22000);
+    const fixes = [
+      { lat: aim.lat - 0.0018 * 40, lon: aim.lon - 0.0009 * 40, altM: aim.h, gs: 228, track: 16.5, vr: 0 },
+      { lat: aim.lat + 0.0019 * 35, lon: aim.lon, altM: aim.h, gs: 211, track: 180, vr: 0 },
+      { lat: aim.lat + 0.0019 * 35, lon: aim.lon + 0.004, altM: aim.h, gs: 211, track: 180, vr: 0 },
+      { lat: 52.60, lon: 4.40, altM: 11200, gs: 240, track: 51, vr: 2 },
+    ];
+    fixes.forEach((f, i) => PTE.upsertPlane(planes, Object.assign({ hex: 'h' + i, flight: 'F' + i, ageS: 1, altSrc: 'geom', feed: 'test' }, f), T));
+    for (const p of planes.values()) predict(p, T);
+    castTracks();
+    for (const p of planes.values()) {
+      const line = casts.get(p.hex);
+      if (!line || !realMin(p.pred.tBest)) { res.push({ hex: p.hex, klass: p.klass, line: !!line }); continue; }
+      const c = castFrom(line, p.pred.tBest)[0], a = c.az * D2R;
+      const dN = (cfg.lat - c.lat) * 111320, dE = (cfg.lon - c.lon) * 111320 * Math.cos(c.lat * D2R);
+      const along = dN * Math.cos(a) + dE * Math.sin(a), across = dE * Math.cos(a) - dN * Math.sin(a);
+      res.push({ hex: p.hex, klass: p.klass, line: true, points: line.length,
+        missR: p.pred.sepMin / target.angR, mapR: Math.hypot(along / c.along, across / c.across) });
+    }
+    return JSON.stringify(res);
+  })()`));
+  assert.ok(out.every(r => r.line), 'every plane above the ground casts a line with the moon 45° up');
+  const timed = out.filter(r => r.missR != null);
+  assert.ok(timed.some(r => r.klass === 'transit') && timed.some(r => r.klass !== 'transit'), JSON.stringify(out));
+  for (const r of timed) {
+    if (r.missR > 8) continue;                  // far off, the footprint is no longer the right ruler
+    assert.ok(Math.abs(r.mapR - r.missR) < 0.05 + 0.03 * r.missR,
+      `${r.hex}: ${r.missR.toFixed(2)} R predicted, ${r.mapR.toFixed(2)} R on the map`);
+  }
 });

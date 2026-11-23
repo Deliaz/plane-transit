@@ -454,7 +454,12 @@ const wingspanM = p => WINGSPAN_M[p.type] || CLASS_SPAN_M[p.cat] || 36;
 
 // `frameMs` is the moment being drawn. tick() draws its own; between ticks animate()
 // asks for the frames in between, and every plane is put where it is *then* (posNow).
+// with "show near misses" off, near passes are drawn as ordinary far traffic
+const kOf = p => (p.klass === 'near' && !cfg.showNear) ? 'far' : p.klass;
+
 function render(frameMs = Date.now(), skyOnly = false) {
+  // the enlarged map covers the sky view: it is the one drawn, every frame
+  if (mapView.big) { renderMap(frameMs, !skyOnly); return; }
   const wrap = canvas.parentElement;
   const dpr = window.devicePixelRatio || 1;
   const W = wrap.clientWidth, H = wrap.clientHeight;
@@ -559,8 +564,6 @@ function render(frameMs = Date.now(), skyOnly = false) {
 
   // planes: paths first, then the target disc over them, then dots + labels on top
   const colors = sky;   // keyed by klass: transit / near / far
-  // with "show near misses" off, near passes are drawn as ordinary far traffic
-  const kOf = p => (p.klass === 'near' && !cfg.showNear) ? 'far' : p.klass;
   ctx.font = '12px system-ui';
   for (const p of shown) {
     const k = kOf(p);
@@ -661,7 +664,7 @@ function render(frameMs = Date.now(), skyOnly = false) {
     ctx.globalAlpha = 1;
   }
 
-  if (cfg.showMap && !skyOnly) renderMap(colors, kOf);   // tiles and a filter: once a tick is plenty
+  if (cfg.showMap && !skyOnly) renderMap(frameMs, true);   // the inset: once a tick is plenty
 }
 
 // A track as a band in perspective: as wide as the plane is near (depth()), and
@@ -779,113 +782,377 @@ function drawPhase(cx, cy, r, k, limbDeg, lit, unlit) {
   ctx.restore();
 }
 
-// ---------- top-down map inset (OpenStreetMap tiles + overlay) ----------
-const mapCanvas = document.getElementById('map');
-const mctx = mapCanvas.getContext('2d');
+// ---------- top-down map (OpenStreetMap tiles + overlay) ----------
+// Two canvases in #mapBox: the tiles underneath, recoloured by a CSS filter and
+// redrawn only when the view moves or a tile arrives, and everything of ours on top,
+// cheap enough to redraw every frame.
+// An inset by default: you in the middle, the search radius to the edge. Clicked, it
+// takes over the view (mapView.big) and can be dragged and zoomed, for looking at
+// where the crossings fall on the ground — see castTracks().
+const mapBox = document.getElementById('mapBox');
+const mapCanvas = document.getElementById('map'), mctx = mapCanvas.getContext('2d');
+const tilesCanvas = document.getElementById('mapTiles'), tctx = tilesCanvas.getContext('2d');
 const MERC_R = 6378137;
 const mercX = lon => MERC_R * lon * D2R;
 const mercY = lat => MERC_R * Math.log(Math.tan(Math.PI / 4 + lat * D2R / 2));
-const tileCache = new Map();   // "z/x/y" -> Image (CORS-enabled so canvas stays clean)
+const mercLat = y => (2 * Math.atan(Math.exp(y / MERC_R)) - Math.PI / 2) * R2D;
+// `zoom` multiplies the scale that fits the search radius; lat/lon is the centre,
+// null while the map still follows you. Kept while the page is open, not saved.
+const mapView = { big: false, zoom: 1, lat: null, lon: null };
+const MAP_ZOOM_OUT = 0.4;      // furthest out: crossings fall well outside the search radius
+const MAP_MIN_MPP = 0.6;       // closest in, ground metres per pixel
+const mapShown = () => mapView.big || cfg.showMap;
 
+const tileCache = new Map();   // "z/x/y" -> Image (CORS-enabled so canvas stays clean), oldest first
+let tilesStale = true, tilesKey = '', tilesFilter = '';
 function getTile(z, x, y) {
   const n = 1 << z;
   x = ((x % n) + n) % n;
   if (y < 0 || y >= n) return null;
   const key = `${z}/${x}/${y}`;
   let img = tileCache.get(key);
-  if (!img) {
-    if (tileCache.size > 120) tileCache.clear();
+  if (img) tileCache.delete(key);                // … and back in below, as the newest
+  else {
+    if (tileCache.size > 400) tileCache.delete(tileCache.keys().next().value);
     img = new Image();
     img.crossOrigin = 'anonymous';
+    img.onload = () => { tilesStale = true; requestMapDraw(); };
     img.src = `https://tile.openstreetmap.org/${key}.png`;
-    tileCache.set(key, img);
   }
+  tileCache.set(key, img);
   return (img.complete && img.naturalWidth) ? img : null;
 }
 
-function renderMap(colors, kOf) {
-  const dpr = window.devicePixelRatio || 1;
-  const S = mapCanvas.clientWidth;                 // css square
-  if (mapCanvas.width !== S * dpr) { mapCanvas.width = S * dpr; mapCanvas.height = S * dpr; }
-  mctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  mctx.clearRect(0, 0, S, S);
-  const B = body(), sky = B.sky;
-  const c = S / 2;
-  const Rm = cfg.radiusNm * 1852;                  // map edge = search radius
-  const cosLat = Math.cos(cfg.lat * D2R);
-  // px per Mercator meter; Mercator inflates ground distance by 1/cos(lat)
-  const scale = (c - 6) / (Rm / cosLat);
-  const toXY = (lat, lon) =>
-    [c + (mercX(lon) - mercX(cfg.lon)) * scale, c - (mercY(lat) - mercY(cfg.lat)) * scale];
+// The view as it stands: its size, its scale and the two ways across it.
+function mapFrame() {
+  const W = +mapBox.clientWidth, H = +mapBox.clientHeight, big = mapView.big;
+  const Rm = cfg.radiusNm * 1852;
+  // px per Mercator metre; Mercator inflates ground distance by 1/cos(lat)
+  const fit = (Math.min(W, H) / 2 - 6) * Math.cos(cfg.lat * D2R) / Rm;   // the search radius to the edge
+  const scale = big ? fit * mapView.zoom : fit;
+  const lat = big && mapView.lat != null ? mapView.lat : cfg.lat;
+  const lon = big && mapView.lon != null ? mapView.lon : cfg.lon;
+  const x0 = mercX(lon), y0 = mercY(lat);
+  return { W, H, big, Rm, fit, scale, lat, lon,
+    xy: (la, lo) => [W / 2 + (mercX(lo) - x0) * scale, H / 2 - (mercY(la) - y0) * scale],
+    at: (x, y) => ({ lat: mercLat(y0 - (y - H / 2) / scale), lon: (x0 + (x - W / 2) / scale) / MERC_R * R2D }),
+    ppm: la => scale / Math.cos(la * D2R),       // px per ground metre at a latitude
+  };
+}
 
-  // OSM tiles, darkened to match the UI
-  const z = Math.max(3, Math.min(17, Math.round(Math.log2(2 * Math.PI * MERC_R * scale / 320))));
-  const tilePx = 2 * Math.PI * MERC_R * scale / (1 << z);   // drawn size of one tile
-  const tx0 = (mercX(cfg.lon) - c / scale + Math.PI * MERC_R) / (2 * Math.PI * MERC_R) * (1 << z);
-  const ty0 = (Math.PI * MERC_R - (mercY(cfg.lat) + c / scale)) / (2 * Math.PI * MERC_R) * (1 << z);
-  mctx.save();
-  mctx.filter = sky.mapFilter;   // sun mode adds sepia so the tiles match the UI
-  for (let i = Math.floor(tx0); (i - tx0) * tilePx < S; i++)
-    for (let j = Math.floor(ty0); (j - ty0) * tilePx < S; j++) {
-      const img = getTile(z, i, j);
-      if (img) mctx.drawImage(img, (i - tx0) * tilePx, (j - ty0) * tilePx, tilePx + 0.5, tilePx + 0.5);
+function drawTiles(f) {
+  const dpr = window.devicePixelRatio || 1, { W, H, scale } = f;
+  const key = [W, H, dpr, f.lat, f.lon, scale].join();
+  if (key === tilesKey && !tilesStale) return;
+  tilesKey = key; tilesStale = false;
+  if (tilesCanvas.width !== W * dpr || tilesCanvas.height !== H * dpr) { tilesCanvas.width = W * dpr; tilesCanvas.height = H * dpr; }
+  tctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  tctx.clearRect(0, 0, W, H);
+  const world = 2 * Math.PI * MERC_R * scale;    // the whole world, px
+  // the inset stretches its tiles a little, to keep their lettering readable; enlarged, sharp wins
+  const z = Math.max(3, Math.min(19, Math.round(Math.log2(world / (f.big ? 256 : 320)))));
+  const n = 1 << z, tilePx = world / n;          // drawn size of one tile
+  const tx0 = (mercX(f.lon) + Math.PI * MERC_R) / (2 * Math.PI * MERC_R) * n - W / 2 / tilePx;
+  const ty0 = (Math.PI * MERC_R - mercY(f.lat)) / (2 * Math.PI * MERC_R) * n - H / 2 / tilePx;
+  for (let i = Math.floor(tx0); (i - tx0) * tilePx < W; i++)
+    for (let j = Math.floor(ty0); (j - ty0) * tilePx < H; j++) {
+      if (j < 0 || j >= n) continue;
+      const x = (i - tx0) * tilePx, y = (j - ty0) * tilePx, xi = ((i % n) + n) % n;
+      const img = getTile(z, xi, j);
+      if (img) { tctx.drawImage(img, x, y, tilePx + 0.5, tilePx + 0.5); continue; }
+      // not here yet: the same ground out of a coarser tile that is, so that zooming
+      // in sharpens the picture instead of blanking it
+      for (let k = 1; k <= 6 && z - k >= 3; k++) {
+        const up = tileCache.get(`${z - k}/${xi >> k}/${j >> k}`);
+        if (!up || !up.complete || !up.naturalWidth) continue;
+        const sz = up.naturalWidth / (1 << k), m = (1 << k) - 1;
+        tctx.drawImage(up, (xi & m) * sz, (j & m) * sz, sz, sz, x, y, tilePx + 0.5, tilePx + 0.5);
+        break;
+      }
     }
-  mctx.restore();
-  mctx.fillStyle = sky.mapDim;                   // dim for overlay contrast
-  mctx.fillRect(0, 0, S, S);
+}
 
-  // range rings
-  const ringKm = Rm > 130000 ? 50 : Rm > 60000 ? 25 : 10;
-  mctx.strokeStyle = sky.mapRing; mctx.fillStyle = sky.mapText;
-  mctx.font = '9px system-ui'; mctx.lineWidth = 1;
-  for (let r = ringKm * 1000; r <= Rm; r += ringKm * 1000) {
-    const rp = (r / cosLat) * scale;
-    mctx.beginPath(); mctx.arc(c, c, rp, 0, 2 * Math.PI); mctx.stroke();
-    mctx.fillText(`${r / 1000}`, c + rp - 12, c - 3);
+// Where each plane's crossing of the disc falls on the ground over the next
+// PREDICT_S: PTE.transitPoint() along its predicted flight, with the body where it
+// will be by then. One list per plane, rebuilt on every tick the map is drawn;
+// `across` and `along` are the disc's own footprint there, in metres (half-widths).
+// The ground is taken to be at the observer's own height — the only one known — so
+// the line through the observer is exactly the pass the prediction reports.
+const casts = new Map();       // hex -> [{ t, lat, lon, az, across, along }], t in s after castsAt
+let castsAt = 0;
+function castTracks() {
+  casts.clear();
+  let at = 0;
+  for (const p of planes.values()) if (p.pred) { at = p.pred.at; break; }
+  if (!at || !(target.el > 1)) return;
+  castsAt = at;
+  const s = site(), rad = target.angR * D2R;
+  const B0 = PTE.bodyEcef(s, cfg.body, new Date(at)), B1 = PTE.bodyEcef(s, cfg.body, new Date(at + 120000));
+  for (const p of planes.values()) {
+    if (!p.pred || p.pred.at !== at) continue;
+    const line = [];
+    for (let t = 0; t <= PREDICT_S; t += p.turn ? 3 : 10) {    // a turn bends it: finer steps
+      const u = t / 120;
+      const g = PTE.transitPoint([B0[0] + (B1[0] - B0[0]) * u, B0[1] + (B1[1] - B0[1]) * u, B0[2] + (B1[2] - B0[2]) * u],
+        planeAt(p, p.age + t), s.h);
+      if (!g) { if (line.length) break; continue; }
+      const across = rad * g.range;
+      line.push({ t, lat: g.lat, lon: g.lon, az: g.az, across, along: across / Math.sin(g.el * D2R) });
+    }
+    if (line.length > 1) casts.set(p.hex, line);
   }
-  mctx.fillText('N', c - 3, 10);
-  mctx.fillText('km', S - 18, c - 3);
+}
+// a cast from `lead` seconds after its tick onward (it is drawn at every frame's own moment)
+function castFrom(line, lead) {
+  const i = line.findIndex(c => c.t > lead);
+  if (i < 0) return [];
+  if (i === 0) return line;
+  const a = line[i - 1], b = line[i], w = (lead - a.t) / (b.t - a.t), mix = k => a[k] + (b[k] - a[k]) * w;
+  return [{ t: lead, lat: mix('lat'), lon: mix('lon'), az: a.az + wrapDeg(b.az - a.az) * w,
+    across: mix('across'), along: mix('along') }].concat(line.slice(i));
+}
+
+const fmtDist = m => m >= 9500 ? `${Math.round(m / 1000)} km` : m >= 950 ? `${(m / 1000).toFixed(1)} km` : `${Math.round(m / 10) * 10} m`;
+
+// `fresh` on a tick: the crossings are worked out anew. Between ticks (and while the
+// map is being dragged) the last ones are drawn again, moved on to this frame's moment.
+function renderMap(frameMs, fresh) {
+  const f = mapFrame(), { W, H, big } = f;
+  const dpr = window.devicePixelRatio || 1;
+  if (mapCanvas.width !== W * dpr || mapCanvas.height !== H * dpr) { mapCanvas.width = W * dpr; mapCanvas.height = H * dpr; }
+  mctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  mctx.clearRect(0, 0, W, H);
+  const B = body(), sky = B.sky;
+  if (tilesFilter !== sky.mapFilter) tilesCanvas.style.filter = tilesFilter = sky.mapFilter;   // sun mode adds sepia
+  drawTiles(f);
+  mctx.fillStyle = sky.mapDim;                   // dim for overlay contrast
+  mctx.fillRect(0, 0, W, H);
+  const [ox, oy] = f.xy(cfg.lat, cfg.lon);       // you
+  const ppm = f.ppm(cfg.lat);
+
+  // range rings round you. Far from a ring's centre only its nearest stretch is
+  // drawn, as a polygon: an arc tens of thousands of px across is not to be trusted.
+  const nearPx = Math.hypot(Math.max(-ox, 0, ox - W), Math.max(-oy, 0, oy - H));
+  const farPx = Math.max(Math.hypot(ox, oy), Math.hypot(W - ox, oy), Math.hypot(ox, H - oy), Math.hypot(W - ox, H - oy));
+  const toView = nearPx > 0 || Math.hypot(W / 2 - ox, H / 2 - oy) > 40 ? Math.atan2(H / 2 - oy, W / 2 - ox) : 0;
+  const ring = rp => {
+    mctx.beginPath();
+    if (rp < 3000) mctx.arc(ox, oy, rp, 0, 2 * Math.PI);
+    else {
+      const half = Math.min(Math.PI, 1.5 * Math.hypot(W, H) / rp);
+      for (let i = 0; i <= 48; i++) {
+        const a = toView - half + 2 * half * i / 48;
+        mctx.lineTo(ox + rp * Math.cos(a), oy + rp * Math.sin(a));
+      }
+    }
+    mctx.stroke();
+  };
+  const ringKm = big ? ([0.2, 0.5, 1, 2, 5, 10, 25, 50, 100].find(k => k * 1000 * ppm >= 70) || 200)
+    : f.Rm > 130000 ? 50 : f.Rm > 60000 ? 25 : 10;
+  mctx.strokeStyle = sky.mapRing; mctx.fillStyle = sky.mapText;
+  mctx.font = `${big ? 11 : 9}px system-ui`; mctx.lineWidth = 1;
+  const first = big ? Math.max(1, Math.ceil(nearPx / ppm / (ringKm * 1000))) : 1;
+  for (let i = first; i < first + 40 && i * ringKm * 1000 <= (big ? farPx / ppm : f.Rm); i++) {
+    const rp = i * ringKm * 1000 * ppm;
+    ring(rp);
+    if (big) mctx.fillText(fmtDist(i * ringKm * 1000), ox + rp * Math.cos(toView) + 4, oy + rp * Math.sin(toView) - 4);
+    else mctx.fillText(`${i * ringKm}`, ox + rp - 12, oy - 3);
+  }
   const osm = '© OpenStreetMap contributors';
-  mctx.fillText(osm, S - mctx.measureText(osm).width - 4, S - 5);
+  if (big) {
+    // the edge of what is known: planes beyond the search radius are not fetched
+    mctx.setLineDash([6, 5]); ring(f.Rm * ppm); mctx.setLineDash([]);
+    mctx.fillText('search radius', ox + f.Rm * ppm * Math.cos(toView - 0.35) + 4, oy + f.Rm * ppm * Math.sin(toView - 0.35));
+    mctx.fillText(osm, 8, H - 8);
+  } else {
+    mctx.fillText('N', W / 2 - 3, 10);
+    mctx.fillText('km', W - 18, H / 2 - 3);
+    mctx.fillText('⤢', W - 14, 12);              // it opens
+    mctx.fillText(osm, W - mctx.measureText(osm).width - 4, H - 5);
+  }
 
-  // observation cone: the azimuth range covered by the sky view
+  // observation cone: the azimuth range covered by the sky view, and the target's bearing
+  const reach = big ? farPx + 50 : Math.min(W, H) / 2 - 10;
   const azHalf = Math.min(cfg.spanDeg / (2 * Math.cos(target.el * D2R)), 90);
-  const a0 = (target.az - azHalf - 90) * D2R, a1 = (target.az + azHalf - 90) * D2R;
-  mctx.fillStyle = B.accent + '1a';
-  mctx.beginPath(); mctx.moveTo(c, c); mctx.arc(c, c, c - 10, a0, a1); mctx.closePath();
-  mctx.fill();
-
-  // target bearing ray
-  const mx = c + Math.sin(target.az * D2R) * (c - 10);
-  const my = c - Math.cos(target.az * D2R) * (c - 10);
+  mctx.fillStyle = B.accent + (big ? '12' : '1a');
+  mctx.beginPath(); mctx.moveTo(ox, oy);
+  for (let i = 0; i <= 16; i++) {
+    const a = (target.az - azHalf + 2 * azHalf * i / 16) * D2R;
+    mctx.lineTo(ox + Math.sin(a) * reach, oy - Math.cos(a) * reach);
+  }
+  mctx.closePath(); mctx.fill();
+  const mx = ox + Math.sin(target.az * D2R) * reach, my = oy - Math.cos(target.az * D2R) * reach;
   mctx.strokeStyle = B.disc + '99'; mctx.setLineDash([4, 3]);
-  mctx.beginPath(); mctx.moveTo(c, c); mctx.lineTo(mx, my); mctx.stroke();
+  mctx.beginPath(); mctx.moveTo(ox, oy); mctx.lineTo(mx, my); mctx.stroke();
   mctx.setLineDash([]);
   mctx.fillStyle = B.disc;
   mctx.beginPath(); mctx.arc(mx, my, 3, 0, 2 * Math.PI); mctx.fill();
 
-  // planes: predicted ground track (+90 s) and current dot
+  if (fresh) castTracks();
+  const castLead = Math.max(0, (frameMs - castsAt) / 1000);
+  const onMap = (x, y, pad) => x > -pad && y > -pad && x < W + pad && y < H + pad;
+  mctx.lineJoin = 'round';
   for (const p of planes.values()) {
     if (!p.pred) continue;
-    const col = colors[kOf(p)];
-    mctx.strokeStyle = col + 'aa'; mctx.lineWidth = 1;
-    mctx.beginPath();
-    for (let t = 0; t <= PREDICT_S; t += 15) {
+    const k = kOf(p), col = sky[k], far = k === 'far';
+    // the plane, where the same dead reckoning has it at this frame, and its ground track
+    const lead = (frameMs - p.pred.at) / 1000;
+    const now = planeAt(p, lead > 0.02 && lead < 5 ? (frameMs - p.posTime) / 1000 : p.age);
+    const [x, y] = f.xy(now.lat, now.lon);
+    mctx.strokeStyle = col + (big ? '66' : 'aa'); mctx.lineWidth = 1;
+    mctx.beginPath(); mctx.moveTo(x, y);
+    for (let t = 15; t <= PREDICT_S; t += 15) {
       const pos = planeAt(p, p.age + t);
-      const [x, y] = toXY(pos.lat, pos.lon);
-      t ? mctx.lineTo(x, y) : mctx.moveTo(x, y);
+      mctx.lineTo(...f.xy(pos.lat, pos.lon));
     }
     mctx.stroke();
-    const now = planeAt(p, p.age);            // same dead-reckoned "now" as the sky view
-    const [x, y] = toXY(now.lat, now.lon);
+
+    // where it crosses the disc: the line on the ground, the band as wide as the
+    // disc once the zoom shows it, and the spot it is at now, tied to the plane
+    const cast = casts.has(p.hex) ? castFrom(casts.get(p.hex), castLead) : [];
+    if (cast.length > 1) {
+      const pts = cast.map(c => f.xy(c.lat, c.lon)), n = pts.length;
+      const half = cast.map((c, i) => {
+        const u = pts[Math.max(0, i - 1)], v = pts[Math.min(n - 1, i + 1)];
+        const len = Math.hypot(v[0] - u[0], v[1] - u[1]) || 1, nx = -(v[1] - u[1]) / len, ny = (v[0] - u[0]) / len;
+        // the disc's footprint is an ellipse, long towards the body: its half-width
+        // square to the line (north is up: azimuth a is the screen direction sin a, -cos a)
+        const a = c.az * D2R, m = f.ppm(c.lat);
+        const w = Math.hypot(c.along * m * (nx * Math.sin(a) - ny * Math.cos(a)), c.across * m * (nx * Math.cos(a) + ny * Math.sin(a)));
+        return [nx * w, ny * w, w];
+      });
+      if (half.some(h => h[2] >= 1)) {
+        mctx.fillStyle = col + '38';
+        mctx.beginPath();
+        pts.forEach(([px, py], i) => mctx.lineTo(px + half[i][0], py + half[i][1]));
+        for (let i = n - 1; i >= 0; i--) mctx.lineTo(pts[i][0] - half[i][0], pts[i][1] - half[i][1]);
+        mctx.closePath(); mctx.fill();
+      }
+      // in the inset, traffic that comes nowhere near you gets the bare line, faint:
+      // forty of them with every mark would bury the two that matter
+      const bare = far && !big;
+      mctx.strokeStyle = col + (bare ? '70' : far ? 'b0' : ''); mctx.lineWidth = far ? 1 : 2;
+      mctx.beginPath();
+      pts.forEach(([px, py], i) => i ? mctx.lineTo(px, py) : mctx.moveTo(px, py));
+      mctx.stroke();
+      if (bare) { mctx.fillStyle = col; mctx.beginPath(); mctx.arc(x, y, 2.5, 0, 2 * Math.PI); mctx.fill(); continue; }
+      // which way the spot runs along it, and (enlarged) when it gets where
+      const [ex, ey] = pts[n - 1], dir = Math.atan2(ey - pts[n - 2][1], ex - pts[n - 2][0]), hs = far ? 4 : 6;
+      mctx.fillStyle = col + (far ? 'b0' : '');
+      mctx.beginPath();
+      mctx.moveTo(ex + Math.cos(dir) * hs, ey + Math.sin(dir) * hs);
+      mctx.lineTo(ex + Math.cos(dir + 2.5) * hs, ey + Math.sin(dir + 2.5) * hs);
+      mctx.lineTo(ex + Math.cos(dir - 2.5) * hs, ey + Math.sin(dir - 2.5) * hs);
+      mctx.closePath(); mctx.fill();
+      if (big && !far) for (const T of [30, 60]) {
+        const c = castFrom(cast, castLead + T)[0];
+        if (!c) continue;
+        const [tx, ty] = f.xy(c.lat, c.lon);
+        mctx.fillRect(tx - 1.5, ty - 1.5, 3, 3);
+        mctx.fillText(`+${T}s`, tx + 5, ty - 4);
+      }
+      const [sx, sy] = pts[0];
+      mctx.strokeStyle = col + (far ? '40' : '80'); mctx.lineWidth = 1; mctx.setLineDash([2, 4]);
+      mctx.beginPath(); mctx.moveTo(x, y); mctx.lineTo(sx, sy); mctx.stroke();
+      mctx.setLineDash([]);
+      mctx.strokeStyle = col; mctx.lineWidth = 1.25;
+      mctx.beginPath(); mctx.arc(sx, sy, big ? 3.5 : 2.5, 0, 2 * Math.PI); mctx.stroke();
+    }
+
     mctx.fillStyle = col;
-    mctx.beginPath(); mctx.arc(x, y, 2.5, 0, 2 * Math.PI); mctx.fill();
+    if (!big) { mctx.beginPath(); mctx.arc(x, y, 2.5, 0, 2 * Math.PI); mctx.fill(); continue; }
+    if (!onMap(x, y, 60)) continue;
+    const tr = p.track * D2R, fx = Math.sin(tr), fy = -Math.cos(tr);
+    mctx.beginPath();
+    mctx.moveTo(x + fx * 7, y + fy * 7);
+    mctx.lineTo(x - fx * 5 - fy * 4.5, y - fy * 5 + fx * 4.5);
+    mctx.lineTo(x - fx * 2, y - fy * 2);
+    mctx.lineTo(x - fx * 5 + fy * 4.5, y - fy * 5 - fx * 4.5);
+    mctx.closePath(); mctx.fill();
+    mctx.globalAlpha = far ? 0.75 : 1;
+    mctx.fillText(`${p.flight} ${(p.altM / 1000).toFixed(1)} km up`, x + 9, y + 4);
+    mctx.globalAlpha = 1;
   }
 
   // observer
   mctx.fillStyle = sky.observer;
-  mctx.beginPath(); mctx.arc(c, c, 2.5, 0, 2 * Math.PI); mctx.fill();
+  mctx.beginPath(); mctx.arc(ox, oy, big ? 4 : 2.5, 0, 2 * Math.PI); mctx.fill();
+  if (big) {
+    mctx.strokeStyle = sky.observer + '99'; mctx.lineWidth = 1.5;
+    mctx.beginPath(); mctx.arc(ox, oy, 8, 0, 2 * Math.PI); mctx.stroke();
+    mctx.fillText('you', ox + 12, oy + 4);
+  }
 }
+
+// ----- the big map: open, close, drag, zoom -----
+let mapDrawQueued = false;
+function requestMapDraw() {        // a redraw outside the tick: a tile arrived, or the view moved
+  if (mapDrawQueued || !window.requestAnimationFrame) return;
+  mapDrawQueued = true;
+  requestAnimationFrame(() => {
+    mapDrawQueued = false;
+    if (started && target && mapShown()) renderMap(Date.now(), false);
+  });
+}
+function setMapBig(on) {
+  mapView.big = on;
+  renderSkyCtl();
+  if (started) render();
+}
+// zoom by `factor` about a point of the view (its middle, without one)
+function zoomMap(factor, x, y) {
+  const f = mapFrame(), mid = x == null;
+  const zMax = Math.max(1, Math.cos(f.lat * D2R) / f.fit / MAP_MIN_MPP);
+  const zoom = Math.max(MAP_ZOOM_OUT, Math.min(zMax, mapView.zoom * factor));
+  if (zoom === mapView.zoom) return;
+  if (!mid || mapView.lat != null) {             // keep the ground under (x, y) where it is
+    if (mid) { x = f.W / 2; y = f.H / 2; }
+    const g = f.at(x, y), scale = f.fit * zoom;
+    mapView.lon = (mercX(g.lon) - (x - f.W / 2) / scale) / MERC_R * R2D;
+    mapView.lat = mercLat(mercY(g.lat) + (y - f.H / 2) / scale);
+  }
+  mapView.zoom = zoom;
+  renderSkyCtl(); requestMapDraw();
+}
+function panMap(dx, dy) {
+  const f = mapFrame(), c = f.at(f.W / 2 - dx, f.H / 2 - dy);
+  mapView.lat = Math.max(-84, Math.min(84, c.lat)); mapView.lon = c.lon;
+  renderSkyCtl(); requestMapDraw();
+}
+function mapHome() {
+  mapView.lat = mapView.lon = null; mapView.zoom = 1;
+  renderSkyCtl(); requestMapDraw();
+}
+mapBox.addEventListener('click', () => { if (!mapView.big) setMapBig(true); });
+mapBox.addEventListener('dblclick', e => {
+  const r = mapBox.getBoundingClientRect();
+  if (mapView.big) zoomMap(2, e.clientX - r.left, e.clientY - r.top);
+});
+mapBox.addEventListener('wheel', e => {
+  if (!mapView.big) return;
+  e.preventDefault();
+  const r = mapBox.getBoundingClientRect();
+  zoomMap(Math.exp(-Math.max(-150, Math.min(150, e.deltaY)) / 300), e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+const mapPtrs = new Map();     // pointers down on the big map: one drags it, two pinch it
+mapBox.addEventListener('pointerdown', e => {
+  if (!mapView.big) return;
+  mapPtrs.set(e.pointerId, [e.clientX, e.clientY]);
+  try { mapBox.setPointerCapture(e.pointerId); } catch (err) { /* gone already */ }
+});
+mapBox.addEventListener('pointermove', e => {
+  const was = mapPtrs.get(e.pointerId);
+  if (!was) return;
+  const other = [...mapPtrs].find(([id]) => id !== e.pointerId);
+  mapPtrs.set(e.pointerId, [e.clientX, e.clientY]);
+  if (!other) { panMap(e.clientX - was[0], e.clientY - was[1]); return; }
+  const [qx, qy] = other[1], r = mapBox.getBoundingClientRect();
+  const d0 = Math.hypot(was[0] - qx, was[1] - qy), d1 = Math.hypot(e.clientX - qx, e.clientY - qy);
+  panMap((e.clientX - was[0]) / 2, (e.clientY - was[1]) / 2);
+  if (d0 > 10 && d1 > 10) zoomMap(d1 / d0, (e.clientX + qx) / 2 - r.left, (e.clientY + qy) / 2 - r.top);
+});
+for (const type of ['pointerup', 'pointercancel'])
+  mapBox.addEventListener(type, e => mapPtrs.delete(e.pointerId));
 
 // ---------- tables & header ----------
 const $ = id => document.getElementById(id);
@@ -1080,16 +1347,33 @@ function setSpan(dir) {
   saveCfg(); renderSkyCtl();
   if (started) render();
 }
+// With the map enlarged the same − / + zoom the map, and the figure between them is
+// how much ground it shows.
 function renderSkyCtl() {
-  $('spanVal').textContent = cfg.spanDeg + '°';
-  $('spanIn').disabled = cfg.spanDeg === SPANS[0];
-  $('spanOut').disabled = cfg.spanDeg === SPANS[SPANS.length - 1];
+  const big = mapView.big;
+  mapBox.hidden = !mapShown();
+  mapBox.classList.toggle('big', big);           // before mapFrame(): it sizes the box
+  if (big) {
+    const f = mapFrame(), mpp = Math.cos(f.lat * D2R) / f.scale;
+    $('spanVal').textContent = fmtDist(f.W * mpp);
+    $('spanIn').disabled = mpp <= MAP_MIN_MPP * 1.01;
+    $('spanOut').disabled = mapView.zoom <= MAP_ZOOM_OUT;
+  } else {
+    $('spanVal').textContent = cfg.spanDeg + '°';
+    $('spanIn').disabled = cfg.spanDeg === SPANS[0];
+    $('spanOut').disabled = cfg.spanDeg === SPANS[SPANS.length - 1];
+  }
+  $('spanVal').title = big ? 'Width of the map' : 'Height of the view';
   $('btnNear').classList.toggle('on', cfg.showNear);
-  $('btnMapToggle').classList.toggle('on', cfg.showMap);
-  $('map').hidden = !cfg.showMap;
+  $('btnMapToggle').classList.toggle('on', mapShown());
+  $('btnMapToggle').textContent = big ? 'sky view' : 'map';
+  $('btnMapToggle').title = big ? 'Back to the sky view' : 'Top-down map';
+  $('mapHomeWrap').hidden = !(big && (mapView.lat != null || mapView.zoom !== 1));
+  $('legendMap').hidden = !big; $('legendSky').hidden = big;
 }
-$('spanIn').addEventListener('click', () => setSpan(-1));
-$('spanOut').addEventListener('click', () => setSpan(+1));
+$('spanIn').addEventListener('click', () => (mapView.big ? zoomMap(2) : setSpan(-1)));
+$('spanOut').addEventListener('click', () => (mapView.big ? zoomMap(0.5) : setSpan(+1)));
+$('btnMapHome').addEventListener('click', mapHome);
 let wheelAcc = 0;   // trackpads send a stream of small deltas: one step per ~a notch
 canvas.addEventListener('wheel', e => {
   e.preventDefault();
@@ -1102,6 +1386,7 @@ $('btnNear').addEventListener('click', () => {
   if (started) tick();
 });
 $('btnMapToggle').addEventListener('click', () => {
+  if (mapView.big) { setMapBig(false); return; }
   cfg.showMap = !cfg.showMap; saveCfg(); renderSkyCtl();
   if (started) render();
 });
@@ -1228,7 +1513,8 @@ document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   if (!$('sunAck').hidden) $('sunAckCancel').click();
   else if (!$('setup').hidden) closeSetup();
-  else $('legend').hidden = true;
+  else if (!$('legend').hidden) { $('legend').hidden = true; $('btnLegend').classList.remove('on'); }
+  else if (mapView.big) setMapBig(false);
 });
 
 function geoNote(msg, tone) {

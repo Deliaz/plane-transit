@@ -229,6 +229,21 @@ Read-only, no login (another reason to keep the server on your own network):
 - **Map inset** (bottom-left): top-down view on real OpenStreetMap tiles — your
   position (white dot, center), range rings in km, the shaded wedge is the sky view's
   azimuth coverage, dashed ray = bearing to the target, plane dots with +90 s ground tracks.
+- **Where the crossings fall** (click the inset): the map takes over the view and can
+  be dragged and zoomed (wheel, pinch, −/+; ⌖ brings you back, **sky view** or Esc
+  closes it). Not every plane near the target crosses it for *you* — but each one
+  crosses it for somebody. For every plane the map draws the line on the ground from
+  which it is seen on the centre of the disc during the next 90 s, with an arrow for
+  the way that spot runs, +30 s / +60 s marks, and a dotted link back to the plane.
+  Zoomed in, the line becomes a band as wide as the disc: stand anywhere in it and the
+  plane is on the disc. The line through your own dot is the pass the countdown is
+  following. Use it to see where you would have had to stand, and to scout: near an
+  airport the lines of landing planes fall on top of each other.
+  Two limits. The ground is taken to be at your own height, and a plane's reported
+  height can be tens of metres off — which moves its line by that much divided by the
+  tangent of the target's elevation (50 m becomes 140 m with the target 20° up). And
+  the lines belong to this moment: the corridor moves as the target moves across the
+  sky, so where they fall now is not where they fall in an hour.
 - **Sound cue** (optional; 🔊 button in the header, volume and test under ⚙) — a countdown you can follow with your
   eye on the viewfinder:
   1. **Heads-up**: a rising two-note chime when a plane becomes a *confident* transit
@@ -277,7 +292,7 @@ Read-only, no login (another reason to keep the server on your own network):
 - **On the sky view**: −/+ (or the mouse wheel) zooms, **near misses** toggles orange
   near-passes in the view, card and timetable (on by default — useful for comparing
   predictions against what you actually see; off keeps only true transits), **map**
-  shows or hides the inset, **?** explains every mark.
+  shows or hides the inset (click the inset itself to enlarge it), **?** explains every mark.
 - **Next-pass card** (top of the sky view): the plane the countdown follows, or the
   next transit — flight, an arrow for the way it crosses the sky, a large "in 36 s" /
   "NOW", miss distance, uncertainty and trust. Readable from a metre away with your

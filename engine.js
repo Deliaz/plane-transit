@@ -344,10 +344,100 @@
     };
   }
 
+  // ---------- the ground under a crossing ----------
+  // The question turned round: not "does this plane cross the disc from here" but
+  // "from where does it". For any plane there is one spot on the ground that sees it
+  // dead centre on the disc — where the line from the body through the plane comes
+  // down, h / tan(elevation) beyond the plane on the side away from the body. As the
+  // plane flies that spot draws a line; standing on the line is a transit.
+  // Nothing above uses any of this: it is for the map, and changes no prediction.
+
+  // inverse of geodeticToECEF (Bowring's closed form: millimetres at aircraft heights;
+  // not for the poles, where the height formula divides by cos lat)
+  function ecefToGeodetic(x, y, z) {
+    const p = Math.hypot(x, y), b = WGS_A * Math.sqrt(1 - WGS_E2), ep2 = WGS_E2 / (1 - WGS_E2);
+    const th = Math.atan2(z * WGS_A, p * b);
+    const lat = Math.atan2(z + ep2 * b * Math.pow(Math.sin(th), 3), p - WGS_E2 * WGS_A * Math.pow(Math.cos(th), 3));
+    const s = Math.sin(lat);
+    return { lat: lat * R2D, lon: Math.atan2(y, x) * R2D, h: p / Math.cos(lat) - WGS_A / Math.sqrt(1 - WGS_E2 * s * s) };
+  }
+  // an ECEF vector as [east, north, up] at lat/lon
+  function enuOf(lat, lon, dx, dy, dz) {
+    const sf = Math.sin(lat * D2R), cf = Math.cos(lat * D2R), sl = Math.sin(lon * D2R), cl = Math.cos(lon * D2R);
+    return [-sl * dx + cl * dy, -sf * cl * dx - sf * sl * dy + cf * dz, cf * cl * dx + cf * sl * dy + sf * dz];
+  }
+
+  // The body's centre as a point in space (ECEF, metres): geometric, no refraction.
+  // A point and not a direction, so the moon's parallax between two places on the
+  // ground comes out by itself. It moves with the sky; over the prediction window a
+  // straight line between two of these is good to a thousandth of a degree.
+  function bodyEcef(site, key, date) {
+    const eq = Astronomy.Equator((BODIES[key] || BODIES.moon).engine, date, site.observer, true, true);
+    const hor = Astronomy.Horizon(date, site.observer, eq.ra, eq.dec);
+    const r = eq.dist * KM_PER_AU * 1000, a = hor.azimuth * D2R, e = hor.altitude * D2R;
+    const E = r * Math.cos(e) * Math.sin(a), N = r * Math.cos(e) * Math.cos(a), U = r * Math.sin(e);
+    const sf = Math.sin(site.lat * D2R), cf = Math.cos(site.lat * D2R);
+    const sl = Math.sin(site.lon * D2R), cl = Math.cos(site.lon * D2R);
+    return [site.ecef[0] - sl * E - sf * cl * N + cf * cl * U,
+      site.ecef[1] + cl * E - sf * sl * N + cf * sl * U,
+      site.ecef[2] + cf * N + sf * U];
+  }
+
+  // Where, at ellipsoidal height `groundH`, a plane at `pos` ({lat, lon, h}) is seen
+  // on the centre of the body at `B` (bodyEcef) — or null when there is no such place
+  // within reach: the body under a degree up, the plane not above that ground, or the
+  // line running out past CAST_MAX_M (with the body low it never comes down at all:
+  // the Earth curves away under it).
+  // Returns the place and how the plane looks from it: {lat, lon, az, el, range}. The
+  // disc's own footprint there is range × its angular radius across the line of sight
+  // and that over sin(el) along it.
+  // It is held to the same frame as the prediction — the body lifted by the full
+  // refraction, the plane by its share — by asking azElRange() itself what that place
+  // would see, and stepping until the two agree. A test puts an observer on the result
+  // and has predictPlane() confirm the transit.
+  const CAST_MAX_M = 400e3;
+  function transitPoint(B, pos, groundH) {
+    if (!(pos.h - groundH > 30)) return null;
+    const P = geodeticToECEF(pos.lat, pos.lon, pos.h);
+    let dx = P[0] - B[0], dy = P[1] - B[1], dz = P[2] - B[2];
+    const L = Math.hypot(dx, dy, dz);
+    dx /= L; dy /= L; dz /= L;
+    // straight down the line from the body through the plane, to that height
+    let g = { lat: pos.lat, lon: pos.lon, h: pos.h }, s = 0;
+    for (let i = 0; i < 8 && Math.abs(g.h - groundH) > 0.05; i++) {
+      const sink = -enuOf(g.lat, g.lon, dx, dy, dz)[2];     // metres down per metre along
+      if (!(sink > 0.017)) return null;
+      s += (g.h - groundH) / sink;
+      if (!(s < CAST_MAX_M)) return null;
+      g = ecefToGeodetic(P[0] + s * dx, P[1] + s * dy, P[2] + s * dz);
+    }
+    if (Math.abs(g.h - groundH) > 0.05) return null;
+    // … then to where the plane *appears* on the centre: a short way towards the
+    // plane, because refraction lifts the body more than it lifts the plane
+    for (let i = 0; i < 6; i++) {
+      const here = { lat: g.lat, lon: g.lon, h: groundH, ecef: geodeticToECEF(g.lat, g.lon, groundH) };
+      const pl = azElRange(here, pos.lat, pos.lon, pos.h);
+      const b = enuOf(g.lat, g.lon, B[0] - here.ecef[0], B[1] - here.ecef[1], B[2] - here.ecef[2]);
+      const geo = Math.atan2(b[2], Math.hypot(b[0], b[1])) * R2D;
+      if (!(geo > 1)) return null;
+      const az = (Math.atan2(b[0], b[1]) * R2D + 360) % 360, el = geo + Astronomy.Refraction('normal', geo);
+      // how far off centre the plane still is from here, in degrees of sky
+      const up = el - pl.el, right = wrapDeg(az - pl.az) * Math.cos(pl.el * D2R);
+      if (Math.hypot(up, right) < 2e-5) return { lat: g.lat, lon: g.lon, az, el, range: pl.range };
+      // walking towards the plane raises it, stepping left slides it to the right
+      const fwd = up * D2R * pl.range / Math.sin(pl.el * D2R), left = right * D2R * pl.range;
+      const a = pl.az * D2R;
+      g = { lat: g.lat + (fwd * Math.cos(a) + left * Math.sin(a)) / 111320,
+        lon: g.lon + (fwd * Math.sin(a) - left * Math.cos(a)) / (111320 * Math.cos(g.lat * D2R)), h: groundH };
+    }
+    return null;
+  }
+
   return {
     PREDICT_S, STALE_MS, KM_PER_AU, FT, KT, FPM, D2R, R2D, WGS_A, WGS_E2, BODIES, TURN, turnRate,
     geodeticToECEF, makeSite, refrShare, azElRange, pointAt, wrapDeg, angularSep,
     bodyAzEl, bodyTarget, limbAngle, targetAt,
     aircraftFix, upsertPlane, dropStalePlanes, planeAt, sepAt, realMin, predictPlane,
+    ecefToGeodetic, bodyEcef, transitPoint,
   };
 });
